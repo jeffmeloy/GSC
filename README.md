@@ -173,38 +173,37 @@ Example Workflow
 API Usage (Python)
 
 The code is organized into modular classes, allowing you to use the components directly in your Python scripts. Here's a basic example of using the DNASupercomputer and GeneticSwarm:
-
       
 from genetic_supercomputer import DNASupercomputer, GeneticSwarm
 
-# Initialize the supercomputer
+Initialize the supercomputer
 supercomputer = DNASupercomputer(dimension=10000, device="cpu")
 
-# Example sequences
+Example sequences
 sequences = [
     "ATGCGTAGCTAGCTAGCTAGCTAGCTA",
     "GCTAGCTAGCTAGCTAGCTAGCTAGC",
     "TTAGCTAGCTAGCTAGCTAGCTAGCT",
 ]
 
-# Encode sequences
+Encode sequences
 encoded_vectors = [supercomputer.encode_sequence(seq) for seq in sequences]
 
-# Initialize the swarm
+Initialize the swarm
 swarm = GeneticSwarm(supercomputer, swarm_size=10)
 
-# Train the swarm
+Train the swarm
 swarm.train(sequences, epochs=3)
 
-# Analyze a sequence
+Analyze a sequence
 analysis_results = swarm.analyze_sequence("ATGCGTAGCTAGCTAGCTAGCTAGCTA")
 print(analysis_results)
 
-# Predict a sequence
+Predict a sequence
 prediction = swarm.predict("ATGCGTAGCTAG", length=10)
 print(f"Prediction: {prediction}")
 
-# Impute a missing segment
+Impute a missing segment
 imputation = swarm.impute_segment("ATGCGT", "AGCTAGCTA", gap_length=5)
 print(f"Imputation: {imputation}")
 
