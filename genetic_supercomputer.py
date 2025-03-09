@@ -16,20 +16,19 @@ import math
 import psutil
 from dataclasses import dataclass, field
 import json
-import pickle
 from Bio import SeqIO
 import gradio as gr
 import matplotlib.pyplot as plt
 import tempfile
 from PIL import Image
-
-try:  # Try importing CuPy with graceful fallback
-    import cupy as cp
-
-    HAS_GPU = cp.is_available()
-except ImportError:
-    cp = None
-    HAS_GPU = False
+from skopt import BayesSearchCV
+from skopt.space import Integer, Real
+from sklearn.base import BaseEstimator
+import requests
+from pybedtools import BedTool
+import pysam
+import pandas as pd
+import random
 
 # Constants for IUPAC codes and other repeated data
 IUPAC_AMBIGUITY_MAP = {
@@ -59,57 +58,65 @@ COMMON_MOTIFS = {  # Moved to module level for reuse
     "GAGAG": 0.5,
 }
 
+
+# Constants
 DEFAULT_ALPHABET = ["A", "T", "G", "C"]
 DEFAULT_BUNDLE_DECAY = 0.9
 DEFAULT_MAX_KMER_SIZE = 30
+HAS_GPU = cp.is_available() if cp else False
 
 
 @dataclass
 class GSCConfig:
-    """Unified configuration for Genetic Supercomputer.
+    """Unified configuration for Genetic Supercomputer with automated tuning.
     Parameters are automatically tuned based on data characteristics and hardware.
     """
 
+    # Core parameters
     dimension: Optional[int] = None
     device: str = "auto"  # 'gpu', 'cpu', or 'auto'
     vector_type: str = "bipolar"
     seed: Optional[int] = None
 
+    # Data-specific parameters
     alphabet: List[str] = field(default_factory=lambda: DEFAULT_ALPHABET)
     data_size: Optional[int] = None
     avg_sequence_length: Optional[int] = None
 
+    # Hyperparameters
     max_kmer_size: int = DEFAULT_MAX_KMER_SIZE
     bundle_decay: float = DEFAULT_BUNDLE_DECAY
     cache_size: Optional[int] = None
     chunk_size: Optional[int] = None
-    position_vectors: Optional[int] = None  # Number of position vectors
-    # Added accuracy_target for dimension calculation
+    position_vectors: Optional[int] = None
     accuracy_target: float = 0.95
 
     def __post_init__(self):
-        """Initialize derived parameters."""
+        """Initialize derived parameters and perform automated tuning."""
+        # Detect hardware capabilities
         self.sys_memory = psutil.virtual_memory().total
         self.gpu_memory = self._detect_gpu_memory()
         self.cpu_cores = os.cpu_count() or 4
 
+        # Set device
         if self.device == "auto":
             self.device = "gpu" if HAS_GPU else "cpu"
 
+        # Initialize parameters using rule-based heuristics
         if self.dimension is None:
             self.dimension = self._derive_optimal_dimension()
-
         if self.cache_size is None:
-            self._set_cache_size()  # Use a separate method for cache sizing
-
+            self._set_cache_size()
         if self.chunk_size is None:
             self._set_chunk_size()
-
         if self.position_vectors is None:
-            # Default: Enough for largest kmer, or 1/10th of dimension, whichever is smaller
             self.position_vectors = min(self.max_kmer_size, self.dimension // 10)
 
+        # Refine parameters using automated tuning
+        self._auto_tune()
+
     def _detect_gpu_memory(self) -> Optional[int]:
+        """Detect available GPU memory."""
         if not HAS_GPU:
             return None
         try:
@@ -119,10 +126,10 @@ class GSCConfig:
 
     def _derive_optimal_dimension(self) -> int:
         """Calculate optimal dimension using Johnson-Lindenstrauss lemma or defaults."""
-        if self.data_size and self.data_size > 1:  # Added check for valid data_size
+        if self.data_size and self.data_size > 1:
             # Johnson-Lindenstrauss lemma
             jl_dim = int(8 * math.log(self.data_size) / (1 - self.accuracy_target) ** 2)
-            # Adjust for alphabet (empirical factor). This can be tuned
+            # Adjust for alphabet (empirical factor)
             alphabet_factor = max(1.0, math.log2(len(self.alphabet)) / 2.0)
             dim = 2 ** math.ceil(math.log2(jl_dim * alphabet_factor))
 
@@ -144,11 +151,8 @@ class GSCConfig:
     def _set_cache_size(self):
         """Set cache size based on available memory."""
         mem_gb = self.sys_memory / (1024**3)
-        # Scale cache size with memory, but also consider dimension
         base_cache_size = int(mem_gb * 50000)
-        dimension_factor = max(
-            1, self.dimension // 1000
-        )  # Larger dimension = smaller cache
+        dimension_factor = max(1, self.dimension // 1000)
         self.cache_size = max(100000, base_cache_size // dimension_factor)
 
     def _set_chunk_size(self):
@@ -158,21 +162,962 @@ class GSCConfig:
             self.gpu_memory * 0.5 if self.gpu_memory else float("inf"),
         )
         bytes_per_vector = self.dimension * (4 if self.vector_type == "bipolar" else 1)
-        # Ensure at least 100, max 10000, but scale with available memory
         self.chunk_size = min(10000, max(100, int(mem_available / bytes_per_vector)))
 
+    def _auto_tune(self):
+        """Refine hyperparameters using Bayesian optimization."""
+        # Define search space
+        search_space = {
+            "dimension": Integer(1024, 16384, name="dimension"),
+            "bundle_decay": Real(0.5, 0.95, name="bundle_decay"),
+            "cache_size": Integer(10000, 1000000, name="cache_size"),
+            "chunk_size": Integer(100, 10000, name="chunk_size"),
+        }
+
+        # Define objective function
+        def objective(params):
+            self.dimension = params["dimension"]
+            self.bundle_decay = params["bundle_decay"]
+            self.cache_size = params["cache_size"]
+            self.chunk_size = params["chunk_size"]
+            return self._evaluate_performance()
+
+        # Perform Bayesian optimization
+        opt = BayesSearchCV(
+            estimator=BaseEstimator(),
+            search_spaces=search_space,
+            n_iter=10,  # Number of iterations
+            cv=3,  # Cross-validation folds
+            random_state=self.seed,
+        )
+        opt.fit(None, None)  # Dummy fit
+        best_params = opt.best_params_
+
+        # Update configuration with best parameters
+        self.dimension = best_params["dimension"]
+        self.bundle_decay = best_params["bundle_decay"]
+        self.cache_size = best_params["cache_size"]
+        self.chunk_size = best_params["chunk_size"]
+
+    def _evaluate_performance(self):
+        """Evaluate HDC performance (e.g., accuracy, memory usage, runtime)."""
+        # Placeholder for actual evaluation logic
+        # For now, return a dummy score based on dimension and bundle_decay
+        return -abs(self.dimension - 4096) / 4096 - abs(self.bundle_decay - 0.85) / 0.85
+
     def to_dict(self) -> Dict[str, Any]:
-        return self.__dict__  # Much cleaner to just return the dict
+        """Convert configuration to a dictionary."""
+        return self.__dict__
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "GSCConfig":
+        """Create a GSCConfig instance from a dictionary."""
         return cls(**{k: v for k, v in config_dict.items() if k in cls.__annotations__})
 
     def __str__(self) -> str:
+        """String representation of the configuration."""
         return (
             f"GSCConfig(dim={self.dimension}, device={self.device}, "
             f"cache={self.cache_size // 1000}K, chunk={self.chunk_size})"
         )
+
+
+class GenomicDataLoader:
+    """Enhanced class for loading and managing genomic data from files and databases.
+
+    Usage Example:
+        # Initialize the data loader
+        data_loader = GenomicDataLoader()
+
+        # Load sequences from a FASTA file
+        sequences, sequence_ids = data_loader.load_sequences("example.fasta")
+
+        # Load regions from a BED file
+        regions, region_ids = data_loader.load_sequences("example.bed", file_type="bed")
+
+        # Fetch data from ENCODE
+        encode_data = data_loader.fetch_encode_data("ENCFF123ABC")
+
+        # Load metadata
+        metadata = data_loader.load_metadata("metadata.json")
+    """
+
+    def __init__(self):
+        """Initialize the GenomicDataLoader with logging."""
+        self.logger = logging.getLogger("GenomicDataLoader")
+        self.logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+        handler.setFormatter(formatter)
+        self.logger.addHandler(handler)
+
+    def load_sequences(
+        self, input_path: str, file_type: str = "auto"
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Load sequences or genomic regions from a file or database.
+
+        Args:
+            input_path: Path to the input file or database accession number.
+            file_type: Type of file or database (e.g., "fasta", "bed", "encode").
+
+        Returns:
+            A tuple containing:
+                - List of sequences or genomic regions.
+                - List of corresponding IDs or descriptions.
+        """
+        if file_type == "auto":
+            file_type = self._detect_file_type(input_path)
+
+        if file_type in ["fasta", "fa", "fna", "fastq", "fq"]:
+            return self._load_fasta_fastq(input_path, file_type)
+        elif file_type == "bed":
+            return self._load_bed(input_path)
+        elif file_type == "gff":
+            return self._load_gff(input_path)
+        elif file_type == "vcf":
+            return self._load_vcf(input_path)
+        elif file_type == "encode":
+            return self._load_encode_data(input_path)
+        elif file_type == "ncbi":
+            return self._load_ncbi_data(input_path)
+        else:
+            raise ValueError(f"Unsupported file type: {file_type}")
+
+    def _detect_file_type(self, input_path: str) -> str:
+        """
+        Detect the file type based on the file extension.
+
+        Args:
+            input_path: Path to the input file.
+
+        Returns:
+            Detected file type (e.g., "fasta", "bed").
+        """
+        ext = input_path[input_path.rfind(".") :].lower()
+        format_map = {
+            ".fasta": "fasta",
+            ".fa": "fasta",
+            ".fna": "fasta",
+            ".fastq": "fastq",
+            ".fq": "fastq",
+            ".bed": "bed",
+            ".gff": "gff",
+            ".vcf": "vcf",
+        }
+        return format_map.get(ext, "fasta")  # Default to FASTA
+
+    def _load_fasta_fastq(
+        self, input_path: str, file_type: str
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Load sequences from a FASTA/FASTQ file.
+
+        Args:
+            input_path: Path to the FASTA/FASTQ file.
+            file_type: Type of file ("fasta" or "fastq").
+
+        Returns:
+            A tuple containing:
+                - List of sequences.
+                - List of sequence IDs.
+        """
+        try:
+            sequences = [
+                str(record.seq).upper() for record in SeqIO.parse(input_path, file_type)
+            ]
+            sequence_ids = [record.id for record in SeqIO.parse(input_path, file_type)]
+            self.logger.info(f"Loaded {len(sequences)} sequences from {input_path}")
+            return sequences, sequence_ids
+        except Exception as e:
+            self.logger.error(f"Error loading FASTA/FASTQ file: {e}")
+            raise
+
+    def _load_bed(self, input_path: str) -> Tuple[List[str], List[str]]:
+        """
+        Load regions from a BED file.
+
+        Args:
+            input_path: Path to the BED file.
+
+        Returns:
+            A tuple containing:
+                - List of regions (chromosome, start, end).
+                - List of region IDs.
+        """
+        try:
+            bed = BedTool(input_path)
+            regions = [
+                (interval.chrom, interval.start, interval.end) for interval in bed
+            ]
+            region_ids = [f"{chrom}:{start}-{end}" for chrom, start, end in regions]
+            self.logger.info(f"Loaded {len(regions)} regions from {input_path}")
+            return regions, region_ids
+        except Exception as e:
+            self.logger.error(f"Error loading BED file: {e}")
+            raise
+
+    def _load_gff(self, input_path: str) -> Tuple[List[str], List[str]]:
+        """
+        Load annotations from a GFF file.
+
+        Args:
+            input_path: Path to the GFF file.
+
+        Returns:
+            A tuple containing:
+                - List of annotations (chromosome, start, end, name).
+                - List of annotation IDs.
+        """
+        try:
+            gff = BedTool(input_path)
+            annotations = [
+                (interval.chrom, interval.start, interval.end, interval.name)
+                for interval in gff
+            ]
+            annotation_ids = [
+                f"{chrom}:{start}-{end}" for chrom, start, end, _ in annotations
+            ]
+            self.logger.info(f"Loaded {len(annotations)} annotations from {input_path}")
+            return annotations, annotation_ids
+        except Exception as e:
+            self.logger.error(f"Error loading GFF file: {e}")
+            raise
+
+    def _load_vcf(self, input_path: str) -> Tuple[List[str], List[str]]:
+        """
+        Load variants from a VCF file.
+
+        Args:
+            input_path: Path to the VCF file.
+
+        Returns:
+            A tuple containing:
+                - List of variants.
+                - List of variant IDs.
+        """
+        try:
+            vcf = pysam.VariantFile(input_path)
+            variants = [str(record) for record in vcf]
+            variant_ids = [record.id for record in vcf]
+            self.logger.info(f"Loaded {len(variants)} variants from {input_path}")
+            return variants, variant_ids
+        except Exception as e:
+            self.logger.error(f"Error loading VCF file: {e}")
+            raise
+
+    def _load_encode_data(self, accession: str) -> Tuple[List[str], List[str]]:
+        """
+        Fetch and load data from the ENCODE database.
+
+        Args:
+            accession: ENCODE accession number.
+
+        Returns:
+            A tuple containing:
+                - List of sequences or regions.
+                - List of corresponding IDs.
+        """
+        try:
+            data = self.fetch_encode_data(accession)
+            sequences = data.get("sequences", [])
+            sequence_ids = data.get("ids", [])
+            self.logger.info(
+                f"Loaded {len(sequences)} sequences from ENCODE accession {accession}"
+            )
+            return sequences, sequence_ids
+        except Exception as e:
+            self.logger.error(f"Error loading ENCODE data: {e}")
+            raise
+
+    def _load_ncbi_data(self, accession: str) -> Tuple[List[str], List[str]]:
+        """
+        Fetch and load data from the NCBI database.
+
+        Args:
+            accession: NCBI accession number.
+
+        Returns:
+            A tuple containing:
+                - List of sequences.
+                - List of sequence IDs.
+        """
+        try:
+            data = self.fetch_ncbi_data(accession)
+            sequences = data.get("sequences", [])
+            sequence_ids = data.get("ids", [])
+            self.logger.info(
+                f"Loaded {len(sequences)} sequences from NCBI accession {accession}"
+            )
+            return sequences, sequence_ids
+        except Exception as e:
+            self.logger.error(f"Error loading NCBI data: {e}")
+            raise
+
+    def fetch_encode_data(
+        self, accession: str, file_type: str = "bed"
+    ) -> Dict[str, Any]:
+        """
+        Fetch data from the ENCODE database.
+
+        Args:
+            accession: ENCODE accession number.
+            file_type: Type of file to fetch (e.g., "bed", "fasta").
+
+        Returns:
+            A dictionary containing the fetched data.
+        """
+        base_url = "https://www.encodeproject.org"
+        url = f"{base_url}/search/?type=File&accession={accession}&file_format={file_type}&format=json"
+        response = requests.get(url)
+        if response.status_code != 200:
+            raise ValueError(f"Failed to fetch data for accession {accession}")
+
+        data = response.json()
+        return data["@graph"][0]  # Return the first result
+
+    def fetch_ncbi_data(
+        self, accession: str, file_type: str = "fasta"
+    ) -> Dict[str, Any]:
+        """
+        Fetch data from the NCBI database.
+
+        Args:
+            accession: NCBI accession number.
+            file_type: Type of file to fetch (e.g., "fasta", "gff").
+
+        Returns:
+            A dictionary containing the fetched data.
+        """
+        base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+        params = {
+            "db": "nucleotide",
+            "id": accession,
+            "rettype": file_type,
+            "retmode": "text",
+        }
+        response = requests.get(base_url, params=params)
+        if response.status_code != 200:
+            raise ValueError(f"Failed to fetch data for accession {accession}")
+
+        return response.text
+
+    def load_metadata(self, metadata_path: str) -> Dict[str, Any]:
+        """
+        Load metadata from a JSON or CSV file.
+
+        Args:
+            metadata_path: Path to the metadata file.
+
+        Returns:
+            A dictionary containing the metadata.
+        """
+        try:
+            if metadata_path.endswith(".json"):
+                with open(metadata_path, "r") as f:
+                    return json.load(f)
+            elif metadata_path.endswith(".csv"):
+                return pd.read_csv(metadata_path).to_dict(orient="records")
+            else:
+                raise ValueError(f"Unsupported metadata format: {metadata_path}")
+        except Exception as e:
+            self.logger.error(f"Error loading metadata: {e}")
+            raise
+
+    def save_results(self, results: Any, output_path: str, format: str = "auto"):
+        """
+        Save analysis results to a file.
+
+        Args:
+            results: The data to save (can be a dictionary, list, NumPy array, etc.).
+            output_path: Path to the output file.
+            format: Output file format ('auto', 'json', 'csv', 'hdf5', 'npy', 'txt').
+        """
+        try:
+            if format == "auto":
+                format = self._detect_output_format(output_path)
+
+            if format == "json":
+                with open(output_path, "w") as f:
+                    json.dump(results, f, indent=4)
+            elif format == "csv":
+                if isinstance(results, list) and all(
+                    isinstance(item, dict) for item in results
+                ):
+                    df = pd.DataFrame(results)
+                    df.to_csv(output_path, index=False)
+                elif isinstance(results, np.ndarray):
+                    np.savetxt(output_path, results, delimiter=",")
+                else:
+                    raise ValueError(
+                        "CSV format only supports lists of dictionaries or NumPy arrays."
+                    )
+            elif format == "hdf5":
+                with h5py.File(output_path, "w") as f:
+                    self._save_hdf5_recursively(f, results)
+            elif format == "npy":
+                np.save(output_path, results)
+            elif format == "txt":  # Simple text format for lists or strings
+                with open(output_path, "w") as f:
+                    if isinstance(results, list):
+                        for item in results:
+                            f.write(str(item) + "\n")
+                    else:
+                        f.write(str(results))
+            else:
+                raise ValueError(f"Unsupported output format: {format}")
+
+            self.logger.info(f"Saved results to {output_path} in {format} format")
+
+        except Exception as e:
+            self.logger.error(f"Error saving results: {e}")
+            raise
+
+    def _detect_output_format(self, output_path: str) -> str:
+        """Detect output file format based on extension."""
+        ext = output_path[output_path.rfind(".") :].lower()
+        format_map = {
+            ".json": "json",
+            ".csv": "csv",
+            ".h5": "hdf5",
+            ".hdf5": "hdf5",
+            ".npy": "npy",
+            ".txt": "txt",
+        }
+        return format_map.get(ext, "txt")  # Default to text
+
+    def _save_hdf5_recursively(
+        self, h5file: h5py.File, data: Any, group_name: str = ""
+    ):
+        """Recursively save data to HDF5, handling nested structures."""
+        if isinstance(data, dict):
+            group = h5file.create_group(group_name) if group_name else h5file
+            for key, value in data.items():
+                self._save_hdf5_recursively(group, value, str(key))
+        elif isinstance(data, (list, tuple)):
+            # Convert lists/tuples to NumPy arrays for efficient storage
+            try:
+                data_array = np.array(data)
+                h5file.create_dataset(group_name, data=data_array)
+            except (
+                Exception
+            ) as e:  # Fallback for mixed types (e.g. list of strings and lists)
+                self.logger.info(f"{group_name} is a list of mixed types: {e}")
+                for idx, item in enumerate(data):
+                    self._save_hdf5_recursively(h5file, item, f"{group_name}_{idx}")
+
+        elif isinstance(data, (np.ndarray, cp.ndarray)):
+            data_np = data.get() if isinstance(data, cp.ndarray) else data
+            h5file.create_dataset(group_name, data=data_np)
+        elif isinstance(data, (int, float, str, bool)):
+            h5file.attrs[group_name] = data  # Store basic types as attributes
+        else:
+            self.logger.warning(
+                f"Unsupported data type for HDF5: {type(data)}. Skipping {group_name}."
+            )
+
+    def load_conservation_file(self, conservation_file: str) -> Dict[int, float]:
+        """
+        Load conservation scores from a file (e.g., phastCons, phyloP).
+
+        Args:
+            conservation_file: Path to the conservation file (wigFix, bigWig, or bedGraph).
+
+        Returns:
+            A dictionary mapping genomic position to conservation score.
+        """
+        conservation_scores = {}
+        try:
+            if conservation_file.endswith((".wig", ".wigFix")):
+                # Handle wigFix format (variableStep or fixedStep)
+                with open(conservation_file, "r") as f:
+                    chrom = None
+                    step = 1
+                    span = 1
+                    start = 1
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("variableStep"):
+                            parts = line.split()
+                            chrom = [p.split("=")[1] for p in parts if "chrom=" in p][0]
+                            span_list = [p.split("=")[1] for p in parts if "span=" in p]
+                            span = int(span_list[0]) if span_list else 1
+
+                        elif line.startswith("fixedStep"):
+                            parts = line.split()
+                            chrom = [p.split("=")[1] for p in parts if "chrom=" in p][0]
+                            start = int(
+                                [p.split("=")[1] for p in parts if "start=" in p][0]
+                            )
+                            step_list = [p.split("=")[1] for p in parts if "step=" in p]
+                            step = int(step_list[0]) if step_list else 1
+                            span_list = [p.split("=")[1] for p in parts if "span=" in p]
+                            span = int(span_list[0]) if span_list else 1
+
+                        elif chrom:  # Only proceed if we are within a track
+                            if line.startswith("variableStep") or line.startswith(
+                                "fixedStep"
+                            ):
+                                continue  # In case the file has multiple tracks
+                            try:
+                                if "variableStep" in locals():  # Check if variableStep
+                                    pos, score = line.split()
+                                    pos, score = int(pos), float(score)
+                                    for i in range(span):
+                                        conservation_scores[pos + i] = score
+                                else:  # fixedStep
+                                    score = float(line)
+                                    for i in range(span):
+                                        conservation_scores[start + i] = score
+                                    start += step
+                            except ValueError:  # Handle potential parsing errors
+                                self.logger.warning(
+                                    f"Skipping line in wigFix file: {line}"
+                                )
+            elif conservation_file.endswith((".bw", ".bigWig")):
+                # Handle bigWig format (requires pyBigWig)
+                import pyBigWig  # Import only if needed
+
+                bw = pyBigWig.open(conservation_file)
+                # This assumes you have a single chromosome; adapt if needed
+                for chrom in bw.chroms():
+                    # Use intervals() to get all (start, end, value) tuples
+                    for start, end, value in bw.intervals(chrom):
+                        for i in range(start, end):
+                            conservation_scores[i] = value
+                bw.close()
+
+            elif conservation_file.endswith(".bedGraph"):
+                # Handle bedGraph format
+                with open(conservation_file, "r") as f:
+                    for line in f:
+                        chrom, start, end, score = line.strip().split()
+                        start, end, score = int(start), int(end), float(score)
+                        for i in range(start, end):
+                            conservation_scores[i] = score
+            else:
+                raise ValueError(
+                    "Unsupported conservation file format.  Use wigFix, bigWig, or bedGraph."
+                )
+
+            self.logger.info(f"Loaded conservation scores from {conservation_file}")
+            return conservation_scores
+
+        except FileNotFoundError:
+            self.logger.error(f"Conservation file not found: {conservation_file}")
+            raise
+        except ImportError as e:
+            if "pyBigWig" in str(e):
+                self.logger.error(
+                    "pyBigWig is required to read bigWig files. Install it with: pip install pybigwig"
+                )
+            else:
+                self.logger.error(f"Import error: {e}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Error loading conservation file: {e}")
+            raise
+
+    def load_annotation_file(self, annotation_file: str) -> Dict[int, Dict[str, Any]]:
+        """
+        Load genomic annotations from a file (e.g., GFF, BED).
+
+        Args:
+            annotation_file: Path to the annotation file.
+
+        Returns:
+            A dictionary mapping genomic position to annotation information.
+        """
+        annotations = {}
+        try:
+            if annotation_file.endswith((".gff", ".gff3")):
+                # Handle GFF/GFF3 format
+                for record in SeqIO.parse(annotation_file, "gff3"):
+                    for feature in record.features:
+                        for i in range(feature.location.start, feature.location.end):
+                            annotations[i] = {
+                                "type": feature.type,
+                                "source": feature.qualifiers.get("source", [""])[0],
+                                "score": feature.qualifiers.get("score", [None])[0],
+                                "strand": feature.strand,
+                                "attributes": feature.qualifiers,
+                            }
+
+            elif annotation_file.endswith(".bed"):
+                # Handle BED format
+                bed = BedTool(annotation_file)
+                for interval in bed:
+                    for i in range(interval.start, interval.end):
+                        annotations[i] = {
+                            "type": interval.name or "region",  # Use name if available
+                            "score": interval.score,
+                            "strand": interval.strand,
+                            "chrom": interval.chrom,
+                        }
+            else:
+                raise ValueError("Unsupported annotation file format. Use GFF or BED.")
+
+            self.logger.info(f"Loaded annotations from {annotation_file}")
+            return annotations
+
+        except FileNotFoundError:
+            self.logger.error(f"Annotation file not found: {annotation_file}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Error loading annotation file: {e}")
+            raise
+
+    def load_epigenetic_file(self, epigenetic_file: str) -> Dict[int, Dict[str, float]]:
+        """
+        Load epigenetic data from a file (e.g., bedGraph, bigWig, narrowPeak, broadPeak)
+
+        Args:
+            epigenetic_file: Path to the epigenetic data file.
+
+        Returns:
+          A dictionary where keys are genomic positions (integers) and values
+          are dictionaries.  The inner dictionaries map epigenetic mark names
+          (e.g., "H3K27ac", "DNase") to their corresponding values (floats) at
+          that position.
+
+        """
+        epigenetic_data = {}
+        try:
+            if epigenetic_file.endswith(".bedGraph"):
+                with open(epigenetic_file, "r") as f:
+                    for line in f:
+                        chrom, start, end, value = line.strip().split()
+                        start, end, value = int(start), int(end), float(value)
+                        # Assuming the file name contains the mark name
+                        mark = epigenetic_file.split(".")[0].split("/")[-1]
+                        for i in range(start, end):
+                            epigenetic_data.setdefault(i, {})[mark] = value
+
+            elif epigenetic_file.endswith((".bw", ".bigWig")):
+                import pyBigWig
+
+                bw = pyBigWig.open(epigenetic_file)
+                mark = epigenetic_file.split(".")[0].split("/")[
+                    -1
+                ]  # Extract mark from filename
+                for chrom in bw.chroms():
+                    for start, end, value in bw.intervals(chrom):
+                        for i in range(start, end):
+                            epigenetic_data.setdefault(i, {})[mark] = value
+                bw.close()
+
+            elif epigenetic_file.endswith((".narrowPeak", ".broadPeak")):
+                with open(epigenetic_file, "r") as f:
+                    for line in f:
+                        fields = line.strip().split()
+                        chrom, start, end = fields[0], int(fields[1]), int(fields[2])
+                        # narrowPeak/broadPeak files may not always have a defined value for all fields
+                        mark = (
+                            fields[3] if len(fields) > 3 else "peak"
+                        )  # Use peak name (or "peak")
+                        value = (
+                            float(fields[4]) if len(fields) > 4 else 1.0
+                        )  # Use signalValue, or default
+
+                        for i in range(start, end):
+                            epigenetic_data.setdefault(i, {})[mark] = value
+            else:
+                raise ValueError(
+                    "Unsupported epigenetic file format. Use bedGraph, bigWig, narrowPeak, or broadPeak."
+                )
+
+            self.logger.info(f"Loaded epigenetic data from {epigenetic_file}")
+            return epigenetic_data
+
+        except FileNotFoundError:
+            self.logger.error(f"Epigenetic file not found: {epigenetic_file}")
+            raise
+        except ImportError as e:
+            if "pyBigWig" in str(e):
+                self.logger.error(
+                    "pyBigWig is required to read bigWig files. Install it with: pip install pybigwig"
+                )
+            else:
+                self.logger.error(f"Import error: {e}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Error loading epigenetic data: {e}")
+            raise
+
+    def load_motif_file(self, motif_file: str) -> List[Dict[str, Any]]:
+        """
+        Load motif data from a file (e.g., JASPAR, MEME, HOMER).
+
+        Args:
+            motif_file: Path to the motif file.
+
+        Returns:
+            A list of dictionaries, where each dictionary represents a motif and
+            contains information like 'name', 'start', 'end', 'score', and 'pattern'.
+        """
+        motifs = []
+        try:
+            if motif_file.endswith(".jaspar"):
+                # Handle JASPAR format
+                with open(motif_file, "r") as f:
+                    for record in SeqIO.parse(f, "jaspar"):
+                        # Assuming simple JASPAR format (adjust as needed)
+                        motifs.append(
+                            {
+                                "name": record.name,
+                                "pattern": str(
+                                    record.seq
+                                ),  # Simplified; use matrix if available
+                                "score": 1.0,  # No scores in simple jaspar format
+                                "start": 0,
+                                "end": len(record.seq),
+                            }
+                        )
+
+            elif motif_file.endswith(".meme"):
+                # Handle MEME format (requires Biopython)
+                from Bio import motifs  # Import only if needed
+
+                with open(motif_file) as handle:
+                    for motif in motifs.parse(handle, "meme"):
+                        # Extract information, adapt based on your needs
+                        for instance in motif.instances:
+                            motifs.append(
+                                {
+                                    "name": motif.name,
+                                    "pattern": str(instance),
+                                    "score": instance.score
+                                    if hasattr(instance, "score")
+                                    else 1.0,  # Fallback in case there is no score
+                                    "start": 0,  # Not directly available in MEME instances
+                                    "end": len(instance),
+                                }
+                            )
+
+            elif motif_file.endswith(".homer"):
+                with open(motif_file, "r") as f:
+                    for line in f:
+                        if line.startswith(">"):
+                            parts = line.strip().split("\t")
+                            motif_info = parts[0][1:].split(",")  # Remove '>' and split
+                            motif_name = motif_info[0]
+                            # HOMER format usually contains position weight matrices, not instances.
+                            # Here we treat the consensus as if it was an instance.
+                            consensus = parts[1]
+                            motifs.append(
+                                {
+                                    "name": motif_name,
+                                    "pattern": consensus,
+                                    "score": 1.0,
+                                    "start": 0,
+                                    "end": len(consensus),
+                                }
+                            )
+
+            else:  # Fallback: Try to parse as simple position/sequence pairs
+                with open(motif_file, "r") as f:
+                    for line in f:
+                        try:
+                            parts = line.strip().split()
+                            if len(parts) >= 2:
+                                # Assume format:  position  sequence [score]
+                                start = int(parts[0])
+                                pattern = parts[1]
+                                score = float(parts[2]) if len(parts) > 2 else 1.0
+                                motifs.append(
+                                    {
+                                        "name": f"motif_{start}",
+                                        "start": start,
+                                        "end": start + len(pattern),
+                                        "pattern": pattern,
+                                        "score": score,
+                                    }
+                                )
+                        except (ValueError, IndexError):
+                            self.logger.warning(f"Skipping line in motif file: {line}")
+
+            self.logger.info(f"Loaded motif data from {motif_file}")
+            return motifs
+
+        except FileNotFoundError:
+            self.logger.error(f"Motif file not found: {motif_file}")
+            raise
+        except ImportError as e:
+            if "Bio" in str(e):
+                self.logger.error(
+                    "Biopython is required to read MEME/JASPAR files.  Install it with: pip install biopython"
+                )
+            else:
+                self.logger.error(f"Import error: {e}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Error loading motif file: {e}")
+            raise
+
+
+class HDCVectorSpace:
+    """Hyperdimensional computing vector space optimized for genetic sequences."""
+
+    def __init__(self, config: "GSCConfig"):
+        self.dim = config.dimension
+        self.device = "gpu" if (config.device == "gpu" and HAS_GPU) else "cpu"
+        self.xp = cp if self.device == "gpu" else np
+        self.vector_type = config.vector_type  # 'binary' or 'bipolar'
+        self.dtype = np.int8 if self.vector_type == "binary" else np.float32
+        self.bundle_decay = config.bundle_decay
+        if config.seed is not None:
+            self.xp.random.seed(config.seed)
+        self.base_vectors = {}
+        self.position_vectors = {}
+        self._vector_cache = lru_cache(maxsize=config.cache_size)(self._encode_kmer)
+
+    def initialize(self, alphabet: List[str] = None) -> "HDCVectorSpace":
+        """Initialize vector space with orthogonal base vectors."""
+        alphabet = alphabet or ["A", "T", "G", "C"]
+        n_vectors = len(alphabet) + self.config.position_vectors
+
+        if self.vector_type == "binary":
+            basis = self.xp.random.randint(
+                2, size=(n_vectors, self.dim), dtype=self.dtype
+            )
+        else:  # Bipolar vectors
+            basis = self.xp.random.choice(
+                [-1, 1], size=(n_vectors, self.dim), dtype=self.dtype
+            )
+
+        basis, _ = self.xp.linalg.qr(basis)
+        for i, base in enumerate(alphabet):  # Assign base vectors
+            self.base_vectors[base] = self._normalize(basis[i])
+        for i in range(len(alphabet), n_vectors):  # Assign position vectors
+            self.position_vectors[f"pos_{i - len(alphabet)}"] = self._normalize(
+                basis[i]
+            )
+
+        return self
+
+    def encode_sequence(self, sequence: str, k: int = 7) -> Any:
+        """Encode complete sequence using sliding k-mers."""
+        if len(sequence) < k:
+            return self._encode_kmer(sequence)
+
+        vectors = [
+            self._encode_kmer(sequence[i : i + k])
+            for i in range(0, len(sequence) - k + 1)
+        ]
+
+        # Combine vectors with exponential decay
+        result = vectors[0]
+        for vec in vectors[1:]:
+            result = self.bundle(result, vec, self.bundle_decay)
+        return self._normalize(result)
+
+    def _encode_kmer(self, kmer: str) -> Any:
+        """Core k-mer encoding with optimized vectorization."""
+        if len(kmer) == 1 and kmer in self.base_vectors:
+            return self.base_vectors[kmer]
+
+        # Vectorized operations for standard bases
+        if all(base in self.base_vectors for base in kmer):
+            xp = self.xp
+            base_vecs = xp.stack([self.base_vectors[b] for b in kmer])
+            pos_vecs = xp.stack(
+                [
+                    self.position_vectors[f"pos_{i % len(self.position_vectors)}"]
+                    for i in range(len(kmer))
+                ]
+            )
+
+            # Vectorized binding and weighted bundling
+            weights = xp.array([self.bundle_decay**i for i in range(len(kmer))])
+            return self._normalize(
+                xp.sum(
+                    xp.multiply(base_vecs, pos_vecs)
+                    * (weights / weights.sum()).reshape(-1, 1),
+                    axis=0,
+                )
+            )
+
+        # Handle ambiguous bases
+        return self._encode_ambiguous(kmer)
+
+    def _encode_ambiguous(self, kmer: str) -> Any:
+        """Handle k-mers with ambiguous bases."""
+        result = self.xp.zeros(self.dim, dtype=self.dtype)
+
+        for i, base in enumerate(kmer):
+            if base in self.base_vectors:
+                vec = self.base_vectors[base]
+            elif base in IUPAC_AMBIGUITY_MAP:
+                # Average vector of possible bases
+                bases = [b for b in IUPAC_AMBIGUITY_MAP[base] if b in self.base_vectors]
+                if not bases:
+                    continue
+                vec = sum(self.base_vectors[b] for b in bases) / len(bases)
+            else:
+                continue
+
+            pos_vec = self.position_vectors[f"pos_{i % len(self.position_vectors)}"]
+            bound = self.xp.multiply(vec, pos_vec)
+            result = self.bundle(result, bound, self.bundle_decay)
+
+        return self._normalize(result)
+
+    def bind(self, v1: Any, v2: Any) -> Any:
+        """Binding operation (element-wise multiplication)."""
+        return self.xp.multiply(v1, v2)
+
+    def bundle(self, v1: Any, v2: Any, alpha: float = None) -> Any:
+        """Bundling operation (weighted sum)."""
+        alpha = alpha if alpha is not None else self.bundle_decay
+        if self.vector_type == "binary":
+            # For binary vectors, use thresholding after bundling
+            result = alpha * v1 + (1 - alpha) * v2
+            return self.xp.where(result > 0.5, 1, 0)
+        else:
+            # For bipolar vectors, use continuous values
+            return alpha * v1 + (1 - alpha) * v2
+
+    def similarity(self, v1: Any, v2: Any) -> float:
+        """Compute similarity between two vectors."""
+        if self.vector_type == "binary":
+            return float(self.xp.sum(v1 == v2) / self.dim)
+        else:  # bipolar
+            return float(self.xp.dot(v1, v2))
+
+    def _normalize(self, v: Any) -> Any:
+        """Normalize a vector."""
+        norm = self.xp.linalg.norm(v)
+        if norm < 1e-10:
+            return v
+        if self.vector_type == "binary":
+            return self.xp.where(v / norm > 0.5, 1, 0)
+        else:  # bipolar
+            return v / norm
+
+    def matched_filter(self, sequence_vectors, filter_vector):
+        """
+        Applies a matched filter (represented by filter_vector) to a
+        sequence of HDC vectors.  This is essentially the same as the
+        convolve method, but we're using the "matched filter" terminology.
+        """
+        return self.convolve(sequence_vectors, filter_vector)
+
+    def circular_shift(self, vector, shift):
+        """
+        Cyclic shift (circular convolution) of an HDC vector.
+
+        Args:
+            vector: The HDC vector to shift (NumPy or CuPy array).
+            shift: The number of positions to shift.  Positive values shift
+                   to the right, negative values shift to the left.
+
+        Returns:
+            The shifted HDC vector (NumPy or CuPy array).
+        """
+        xp = self.xp  # Use the appropriate array library (NumPy or CuPy)
+        return xp.roll(vector, shift)
 
 
 class Utils:
@@ -329,239 +1274,648 @@ class Utils:
             conservation_scores.append(max_freq / len(sequences))
         return conservation_scores
 
-
-class GenomicDataLoader:
-    """Class for loading and saving genomic data files."""
-
-    def __init__(self):
-        self.logger = logging.getLogger("GenomicDataLoader")
-
-    def load_sequences(self, input_path: str) -> Tuple[List[str], List[str]]:
-        """Load sequences from a FASTA/FASTQ file."""
-        try:
-            format_map = {
-                ".fasta": "fasta",
-                ".fa": "fasta",
-                ".fna": "fasta",
-                ".fastq": "fastq",
-                ".fq": "fastq",
-            }
-
-            ext = os.path.splitext(input_path.lower())[1]
-            file_format = format_map.get(ext, "fasta")
-
-            sequences = [
-                str(record.seq).upper()
-                for record in SeqIO.parse(input_path, file_format)
+    @staticmethod  # Added to Utils
+    def handle_ambiguous_base(base: str, hdc: HDCVectorSpace) -> Optional[Any]:
+        """Handles an ambiguous base by averaging the HDC vectors of its
+        possible bases. Returns None if no valid bases are found."""
+        if base in hdc.base_vectors:
+            return hdc.base_vectors[base]
+        elif base in IUPAC_AMBIGUITY_MAP:
+            valid_bases = [
+                b for b in IUPAC_AMBIGUITY_MAP[base] if b in hdc.base_vectors
             ]
-            sequence_ids = [
-                record.id for record in SeqIO.parse(input_path, file_format)
-            ]
+            if valid_bases:
+                return sum(hdc.base_vectors[b] for b in valid_bases) / len(valid_bases)
+        return None
 
-            self.logger.info(f"Loaded {len(sequences)} sequences from {input_path}")
-            return sequences, sequence_ids
+    @staticmethod  # Added to Utils.
+    def encode_kmer_basic(kmer: str, hdc: HDCVectorSpace) -> Any:
+        """
+        Basic k-mer encoding (without biological features).  This is suitable
+        for use in DNAEncoder.
+        """
+        xp = hdc.xp
 
-        except Exception as e:
-            self.logger.error(f"Error loading sequences: {e}")
-            sys.exit(1)
+        if len(kmer) == 1 and kmer in hdc.base_vectors:
+            return hdc.base_vectors[kmer]
 
-    def save_results(self, results, output_path: str, format: str = "auto"):
-        """Save analysis results to file."""
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-
-        if format == "auto":
-            ext = os.path.splitext(output_path.lower())[1]
-            format = {
-                ".h5": "hdf5",
-                ".npy": "numpy",
-                ".npz": "numpy",
-                ".json": "json",
-                ".txt": "text",
-                ".csv": "text",
-            }.get(ext, "pickle")
-
-        try:
-            if format == "hdf5":
-                with h5py.File(output_path, "w") as f:
-                    if isinstance(results, (list, np.ndarray)):
-                        f.create_dataset("data", data=np.array(results))
-                    elif isinstance(results, dict):
-                        for k, v in results.items():
-                            if isinstance(v, (np.ndarray, list)):
-                                f.create_dataset(k, data=np.array(v))
-                            else:
-                                f.attrs[k] = v
-
-            elif format == "numpy":
-                np.save(output_path, np.array(results))
-
-            elif format == "json":
-
-                class NumpyEncoder(json.JSONEncoder):
-                    def default(self, obj):
-                        if isinstance(obj, np.ndarray):
-                            return obj.tolist()
-                        return json.JSONEncoder.default(self, obj)
-
-                with open(output_path, "w") as f:
-                    json.dump(results, f, indent=2, cls=NumpyEncoder)
-
-            elif format == "text":
-                with open(output_path, "w") as f:
-                    if isinstance(results, str):
-                        f.write(results)
-                    elif isinstance(results, (list, dict)):
-                        for item in results:
-                            f.write(f"{item}\n")
-
-            else:  # pickle fallback
-                with open(output_path, "wb") as f:
-                    pickle.dump(results, f)
-
-            self.logger.info(f"Results saved to {output_path}")
-
-        except Exception as e:
-            self.logger.error(f"Error saving results: {e}")
-
-
-class HDCVectorSpace:
-    """Hyperdimensional computing vector space optimized for genetic sequences."""
-
-    def __init__(self, config: "GSCConfig"):
-        self.dim = config.dimension
-        self.device = "gpu" if (config.device == "gpu" and HAS_GPU) else "cpu"
-        self.xp = cp if self.device == "gpu" else np
-        self.vector_type = config.vector_type  # 'binary' or 'bipolar'
-        self.dtype = np.int8 if self.vector_type == "binary" else np.float32
-        self.bundle_decay = config.bundle_decay
-        if config.seed is not None:
-            self.xp.random.seed(config.seed)
-        self.base_vectors = {}
-        self.position_vectors = {}
-        self._vector_cache = lru_cache(maxsize=config.cache_size)(self._encode_kmer)
-
-    def initialize(self, alphabet: List[str] = None) -> "HDCVectorSpace":
-        """Initialize vector space with orthogonal base vectors."""
-        alphabet = alphabet or ["A", "T", "G", "C"]
-        n_vectors = len(alphabet) + self.config.position_vectors
-
-        if self.vector_type == "binary":
-            basis = self.xp.random.randint(
-                2, size=(n_vectors, self.dim), dtype=self.dtype
-            )
-        else:  # Bipolar vectors
-            basis = self.xp.random.choice(
-                [-1, 1], size=(n_vectors, self.dim), dtype=self.dtype
-            )
-
-        basis, _ = self.xp.linalg.qr(basis)
-        for i, base in enumerate(alphabet):  # Assign base vectors
-            self.base_vectors[base] = self._normalize(basis[i])
-        for i in range(len(alphabet), n_vectors):  # Assign position vectors
-            self.position_vectors[f"pos_{i - len(alphabet)}"] = self._normalize(
-                basis[i]
-            )
-
-        return self
-
-    def encode_sequence(self, sequence: str, k: int = 7) -> Any:
-        """Encode complete sequence using sliding k-mers."""
-        if len(sequence) < k:
-            return self._encode_kmer(sequence)
-
-        vectors = [
-            self._encode_kmer(sequence[i : i + k])
-            for i in range(0, len(sequence) - k + 1)
-        ]
-
-        # Combine vectors with exponential decay
-        result = vectors[0]
-        for vec in vectors[1:]:
-            result = self.bundle(result, vec, self.bundle_decay)
-        return self._normalize(result)
-
-    def _encode_kmer(self, kmer: str) -> Any:
-        """Core k-mer encoding with optimized vectorization."""
-        if len(kmer) == 1 and kmer in self.base_vectors:
-            return self.base_vectors[kmer]
-
-        # Vectorized operations for standard bases
-        if all(base in self.base_vectors for base in kmer):
-            xp = self.xp
-            base_vecs = xp.stack([self.base_vectors[b] for b in kmer])
-            pos_vecs = xp.stack(
-                [
-                    self.position_vectors[f"pos_{i % len(self.position_vectors)}"]
-                    for i in range(len(kmer))
-                ]
-            )
-
-            # Vectorized binding and weighted bundling
-            weights = xp.array([self.bundle_decay**i for i in range(len(kmer))])
-            return self._normalize(
-                xp.sum(
-                    xp.multiply(base_vecs, pos_vecs)
-                    * (weights / weights.sum()).reshape(-1, 1),
-                    axis=0,
-                )
-            )
-
-        # Handle ambiguous bases
-        return self._encode_ambiguous(kmer)
-
-    def _encode_ambiguous(self, kmer: str) -> Any:
-        """Handle k-mers with ambiguous bases."""
-        result = self.xp.zeros(self.dim, dtype=self.dtype)
-
+        result = xp.zeros(hdc.dim, dtype=xp.float32)
         for i, base in enumerate(kmer):
-            if base in self.base_vectors:
-                vec = self.base_vectors[base]
-            elif base in IUPAC_AMBIGUITY_MAP:
-                # Average vector of possible bases
-                bases = [b for b in IUPAC_AMBIGUITY_MAP[base] if b in self.base_vectors]
-                if not bases:
-                    continue
-                vec = sum(self.base_vectors[b] for b in bases) / len(bases)
-            else:
+            base_vector = Utils.handle_ambiguous_base(base, hdc)  # Use utility function
+            if base_vector is not None:
+                pos_vector = hdc.position_vectors[
+                    f"pos_{i % len(hdc.position_vectors)}"
+                ]
+                bound = hdc.bind(base_vector, pos_vector)
+                result = hdc.bundle(result, bound, hdc.bundle_decay)
+
+        return hdc._normalize(result)
+
+    @staticmethod
+    def calculate_distances(
+        vector1: Any,
+        vector2: Any,
+        methods: List[str] = ["euclidean", "mahalanobis", "hyperbolic"],
+    ) -> Dict[str, float]:
+        """Calculate multiple distance metrics between vectors."""
+        distances = {}
+        if "euclidean" in methods:
+            distances["euclidean"] = float(torch.norm(vector1 - vector2))
+
+        if "mahalanobis" in methods:
+            diff = vector1 - vector2
+            stacked = torch.stack([vector1, vector2], dim=1)
+            cov_matrix = torch.cov(stacked.T)
+            inv_cov = torch.linalg.inv(cov_matrix)
+            distances["mahalanobis"] = float(
+                torch.sqrt(torch.matmul(torch.matmul(diff.T, inv_cov), diff))
+            )
+
+        if "hyperbolic" in methods:
+            x_norm, y_norm = torch.norm(vector1), torch.norm(vector2)
+            x_p = vector1 / (1 + torch.sqrt(1 + x_norm**2))
+            y_p = vector2 / (1 + torch.sqrt(1 + y_norm**2))
+            distances["hyperbolic"] = float(torch.acosh(1 - 2 * torch.sum(x_p * y_p)))
+
+        return distances
+
+    @staticmethod
+    def calculate_swarm_repulsion(
+        positions: List[Any], min_distance: float = 0.1
+    ) -> List[Any]:
+        """Calculate repulsion forces to maintain swarm spacing."""
+        forces = [torch.zeros_like(pos) for pos in positions]
+
+        for i, pos_i in enumerate(positions):
+            for j, pos_j in enumerate(positions):
+                if i != j:
+                    diff = pos_i - pos_j
+                    dist = torch.norm(diff)
+                    if dist < min_distance:
+                        # Repulsive force inversely proportional to distance
+                        force = diff * (1 / dist**2 - 1 / min_distance**2)
+                        forces[i] += force
+                        forces[j] -= force
+        return forces
+
+    def convolve(self, sequence_vectors, filter_vector):
+        """Convolve (efficient matrix-based implementation)."""
+        xp = self.xp
+        sequence_matrix = xp.stack(sequence_vectors)
+        similarities = xp.dot(sequence_matrix, filter_vector)
+        return similarities.tolist()
+
+    def max_pool(self, feature_map, window_size=4):
+        """Max pooling (efficient reshaping)."""
+        xp = self.xp
+        if not feature_map:
+            return []
+        num_pools = len(feature_map) // window_size
+        if num_pools == 0:
+            return [xp.max(feature_map)]
+        reshaped = xp.array(feature_map[: num_pools * window_size]).reshape(
+            num_pools, window_size
+        )
+        pooled = xp.max(reshaped, axis=1)
+        return pooled.tolist()
+
+    def circular_shift(self, vector, shift):
+        """Cyclic shift."""
+        xp = self.xp
+        return xp.roll(vector, shift)
+
+
+class HDCMotifDiscovery:
+    """
+    Hyperdimensional computing-based motif discovery system that leverages
+    both known motifs and discovers new ones from sequence data.
+
+    Features:
+    - Bootstraps from known motifs in COMMON_MOTIFS
+    - Automatically discovers and classifies novel motifs
+    - Groups similar motifs into families
+    - Provides consensus representations
+    - Scores sequences for motif enrichment
+    """
+
+    def __init__(self, hdc_computer, projection_dim=128, similarity_threshold=0.82):
+        """
+        Initialize the HDC motif discovery system.
+
+        Args:
+            hdc_computer: An HDCVectorSpace instance
+            projection_dim: Dimension for projection space (for clustering)
+            similarity_threshold: Threshold for considering motifs similar
+        """
+        self.hdc = hdc_computer
+        self.similarity_threshold = similarity_threshold
+        self.projection_dim = projection_dim
+
+        # Initialize storage for motifs
+        self.motif_anchors = {}  # Known/seed motifs
+        self.motif_clusters = {}  # Expanded motif families
+        self.novel_motifs = {}  # Discovered motifs not close to known ones
+        self.motif_families = {}  # Grouping of motifs by family
+
+        # For embedding projection (dimensionality reduction)
+        self.projector = self._build_projector(self.hdc.hdc.dim, projection_dim)
+
+        # Bootstrap with COMMON_MOTIFS
+        self._bootstrap_from_common_motifs()
+
+    def _build_projector(self, input_dim, output_dim):
+        """Build a simple projection matrix for dimensionality reduction."""
+        # Use stable random projections for vector embedding
+        xp = self.hdc.hdc.xp
+        seed = 42  # Fixed seed for reproducibility
+        rng = np.random.RandomState(seed)
+        projection = rng.normal(0, 1.0 / np.sqrt(output_dim), (input_dim, output_dim))
+        return xp.array(projection)
+
+    def _bootstrap_from_common_motifs(self):
+        """Initialize motif space using COMMON_MOTIFS as anchors."""
+        for motif, weight in COMMON_MOTIFS.items():
+            # Skip motifs with ambiguous bases for now
+            if "N" in motif and len(motif) > 8:
                 continue
 
-            pos_vec = self.position_vectors[f"pos_{i % len(self.position_vectors)}"]
-            bound = self.xp.multiply(vec, pos_vec)
-            result = self.bundle(result, bound, self.bundle_decay)
+            # Encode the motif using HDC
+            motif_vec = self.hdc.encode_kmer(motif)
 
-        return self._normalize(result)
+            # Guess the motif family based on common patterns
+            family = self._guess_motif_family(motif)
 
-    def bind(self, v1: Any, v2: Any) -> Any:
-        """Binding operation (element-wise multiplication)."""
-        return self.xp.multiply(v1, v2)
+            # Store as an anchor
+            self.motif_anchors[motif] = {
+                "vector": motif_vec,
+                "weight": weight,
+                "family": family,
+                "consensus": motif,
+                "variants": [motif],
+                "scores": {},  # Will store scores against sequences
+                "positions": {},  # Will track positions where found
+            }
 
-    def bundle(self, v1: Any, v2: Any, alpha: float = None) -> Any:
-        """Bundling operation (weighted sum)."""
-        alpha = alpha if alpha is not None else self.bundle_decay
-        if self.vector_type == "binary":
-            # For binary vectors, use thresholding after bundling
-            result = alpha * v1 + (1 - alpha) * v2
-            return self.xp.where(result > 0.5, 1, 0)
+            # Initialize the cluster for this motif
+            self.motif_clusters[motif] = []
+
+            # Add to family grouping
+            if family not in self.motif_families:
+                self.motif_families[family] = []
+            self.motif_families[family].append(motif)
+
+    def _guess_motif_family(self, motif):
+        """Guess the motif family based on sequence patterns."""
+        if motif in ["TATA", "TATAA", "TATAAA"]:
+            return "TATA_box"
+        elif motif in ["CAAT", "CCAAT"]:
+            return "CAAT_box"
+        elif "GATA" in motif:
+            return "GATA_factor"
+        elif "CACGTG" in motif:
+            return "E_box"
+        elif "GCC" in motif and "GGC" in motif:
+            return "GC_rich"
+        elif motif in ["TTGACA", "TATAAT"]:
+            return "Bacterial_promoter"
+        elif motif == "AATAAA":
+            return "PolyA_signal"
+        elif "GAGAG" in motif:
+            return "GA_repeat"
         else:
-            # For bipolar vectors, use continuous values
-            return alpha * v1 + (1 - alpha) * v2
+            return "Other"
 
-    def similarity(self, v1: Any, v2: Any) -> float:
-        """Compute similarity between two vectors."""
-        if self.vector_type == "binary":
-            return float(self.xp.sum(v1 == v2) / self.dim)
-        else: # bipolar 
-            return float(self.xp.dot(v1, v2))
+    def discover_motifs(self, sequences, k_range=(5, 12), min_support=3, stride=1):
+        """
+        Discover motifs from a set of sequences.
 
-    def _normalize(self, v: Any) -> Any:
-        """Normalize a vector."""
-        norm = self.xp.linalg.norm(v)
-        if norm < 1e-10:
-            return v
-        if self.vector_type == "binary":
-            return self.xp.where(v / norm > 0.5, 1, 0)
-        else: # bipolar
-            return v / norm
+        Args:
+            sequences: List of DNA sequences
+            k_range: Range of k-mer sizes to consider (min, max)
+            min_support: Minimum number of occurrences required
+            stride: Step size for sliding window
+
+        Returns:
+            Dictionary of discovered motifs
+        """
+        # Extract all k-mers from sequences
+        all_kmers = []
+        kmer_positions = {}
+
+        for k in range(k_range[0], k_range[1] + 1):
+            for seq_idx, seq in enumerate(sequences):
+                for i in range(0, len(seq) - k + 1, stride):
+                    kmer = seq[i : i + k]
+                    # Skip k-mers with non-standard bases
+                    if any(base not in "ACGT" for base in kmer):
+                        continue
+                    all_kmers.append(kmer)
+                    if kmer not in kmer_positions:
+                        kmer_positions[kmer] = []
+                    kmer_positions[kmer].append((seq_idx, i))
+
+        # Count occurrences and filter by min_support
+        kmer_counts = {}
+        for kmer in all_kmers:
+            kmer_counts[kmer] = kmer_counts.get(kmer, 0) + 1
+
+        frequent_kmers = [
+            kmer for kmer, count in kmer_counts.items() if count >= min_support
+        ]
+
+        # Encode k-mers and cluster them
+        vectors = {}
+        for kmer in frequent_kmers:
+            vectors[kmer] = self.hdc.encode_kmer(kmer)
+
+        # Find motifs similar to known anchors
+        self._assign_to_existing_clusters(vectors, kmer_positions)
+
+        # Discover novel motifs from remaining k-mers
+        self._discover_novel_clusters(
+            {
+                k: v
+                for k, v in vectors.items()
+                if not any(k in cluster for cluster in self.motif_clusters.values())
+            }
+        )
+
+        # Update consensus motifs for each cluster
+        self._update_consensus_motifs()
+
+        return self.get_all_motifs()
+
+    def _assign_to_existing_clusters(self, kmer_vectors, kmer_positions):
+        """Assign k-mers to existing motif clusters."""
+        # For each k-mer, check if it's similar to any known motif
+        for kmer, vector in kmer_vectors.items():
+            best_anchor = None
+            best_sim = -1
+
+            # Compare to each anchor motif
+            for anchor, data in self.motif_anchors.items():
+                sim = float(self.hdc.hdc.similarity(vector, data["vector"]))
+                if sim > self.similarity_threshold and sim > best_sim:
+                    best_anchor = anchor
+                    best_sim = sim
+
+            # If similar to a known motif, add to its cluster
+            if best_anchor:
+                self.motif_clusters[best_anchor].append(kmer)
+                self.motif_anchors[best_anchor]["variants"].append(kmer)
+
+                # Store positions where this k-mer was found
+                for seq_idx, pos in kmer_positions.get(kmer, []):
+                    if seq_idx not in self.motif_anchors[best_anchor]["positions"]:
+                        self.motif_anchors[best_anchor]["positions"][seq_idx] = []
+                    self.motif_anchors[best_anchor]["positions"][seq_idx].append(pos)
+
+    def _discover_novel_clusters(self, remaining_vectors, min_cluster_size=3):
+        """Discover novel motif clusters from remaining k-mers."""
+        if not remaining_vectors:
+            return
+
+        # Project vectors to lower dimension for clustering
+        kmers = list(remaining_vectors.keys())
+        vectors = list(remaining_vectors.values())
+
+        # Skip if too few vectors
+        if len(vectors) < min_cluster_size:
+            return
+
+        # Convert to numpy for clustering
+        if self.hdc.hdc.device == "gpu":
+            vectors_np = [v.get() for v in vectors]
+        else:
+            vectors_np = vectors
+
+        # Compute pairwise similarity matrix
+        n = len(vectors_np)
+        sim_matrix = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i, n):
+                sim = float(np.dot(vectors_np[i], vectors_np[j]))
+                sim_matrix[i, j] = sim
+                sim_matrix[j, i] = sim
+
+        # Try to use HDBSCAN for clustering if available
+        try:
+            import hdbscan
+
+            clusterer = hdbscan.HDBSCAN(
+                min_cluster_size=min_cluster_size,
+                min_samples=2,
+                metric="precomputed",
+                core_dist_n_jobs=-1,
+            )
+            # Convert similarity to distance
+            distance_matrix = 1 - sim_matrix
+            labels = clusterer.fit_predict(distance_matrix)
+
+        except ImportError:
+            # Fallback to simple threshold-based clustering
+            from sklearn.cluster import AgglomerativeClustering
+
+            clusterer = AgglomerativeClustering(
+                n_clusters=None,
+                distance_threshold=1 - self.similarity_threshold,
+                metric="precomputed",
+                linkage="average",
+            )
+            # Convert similarity to distance
+            distance_matrix = 1 - sim_matrix
+            labels = clusterer.fit_predict(distance_matrix)
+
+        # Organize into clusters
+        clusters = {}
+        for i, label in enumerate(labels):
+            if label == -1:  # Skip noise points
+                continue
+            if label not in clusters:
+                clusters[label] = []
+            clusters[label].append(kmers[i])
+
+        # Add novel clusters that are large enough
+        for cluster_id, members in clusters.items():
+            if len(members) >= min_cluster_size:
+                # Calculate consensus for this cluster
+                consensus = self._derive_consensus(members)
+                family = self._guess_motif_family(consensus)
+
+                # Create a new anchor for this novel motif
+                self.novel_motifs[consensus] = {
+                    "vector": self.hdc.encode_kmer(consensus),
+                    "weight": 0.5,  # Start with lower confidence
+                    "family": family,
+                    "consensus": consensus,
+                    "variants": members,
+                    "scores": {},
+                    "positions": {},
+                }
+
+                # Add to family grouping
+                if family not in self.motif_families:
+                    self.motif_families[family] = []
+                self.motif_families[family].append(consensus)
+
+    def _derive_consensus(self, sequences):
+        """Derive a consensus sequence from a set of related sequences."""
+        if not sequences:
+            return ""
+
+        # Handle variable lengths by focusing on the mode length
+        lengths = [len(seq) for seq in sequences]
+        mode_length = max(set(lengths), key=lengths.count)
+        filtered_seqs = [seq for seq in sequences if len(seq) == mode_length]
+
+        # Build position-specific base counts
+        counts = []
+        for i in range(mode_length):
+            pos_counts = {"A": 0, "C": 0, "G": 0, "T": 0}
+            for seq in filtered_seqs:
+                if i < len(seq):
+                    pos_counts[seq[i]] = pos_counts.get(seq[i], 0) + 1
+            counts.append(pos_counts)
+
+        # Generate consensus by taking the most frequent base at each position
+        consensus = ""
+        for pos_counts in counts:
+            max_base = max(pos_counts.items(), key=lambda x: x[1])[0]
+            consensus += max_base
+
+        return consensus
+
+    def _update_consensus_motifs(self):
+        """Update consensus motifs for all clusters."""
+        # Update consensus for known motifs with variants
+        for motif, data in self.motif_anchors.items():
+            if len(data["variants"]) > 1:
+                consensus = self._derive_consensus(data["variants"])
+                # Only update if consensus is different and not degenerate
+                if consensus != motif and consensus != "":
+                    data["consensus"] = consensus
+
+    def score_sequence(self, sequence, window_size=20, stride=5):
+        """
+        Score a sequence for motif enrichment.
+
+        Args:
+            sequence: DNA sequence to score
+            window_size: Size of sliding window
+            stride: Step size for window
+
+        Returns:
+            Dictionary with motif scores and positions
+        """
+        result = {"motif_scores": {}, "motif_positions": {}, "family_scores": {}}
+
+        # Initialize scores for all motifs
+        all_motifs = list(self.motif_anchors.keys()) + list(self.novel_motifs.keys())
+        for motif in all_motifs:
+            result["motif_scores"][motif] = 0
+            result["motif_positions"][motif] = []
+
+        # Score sequence windows
+        for i in range(0, len(sequence) - window_size + 1, stride):
+            window = sequence[i : i + window_size]
+            window_vec = self.hdc.encode_sequence(window)
+
+            # Score against known motifs
+            for motif, data in self.motif_anchors.items():
+                sim = float(self.hdc.hdc.similarity(window_vec, data["vector"]))
+                if sim > self.similarity_threshold:
+                    result["motif_scores"][motif] += sim * data["weight"]
+                    result["motif_positions"][motif].append((i, sim))
+
+            # Score against novel motifs
+            for motif, data in self.novel_motifs.items():
+                sim = float(self.hdc.hdc.similarity(window_vec, data["vector"]))
+                if sim > self.similarity_threshold:
+                    result["motif_scores"][motif] += sim * data["weight"]
+                    result["motif_positions"][motif].append((i, sim))
+
+        # Calculate family-level scores
+        for family, motifs in self.motif_families.items():
+            family_score = sum(result["motif_scores"].get(motif, 0) for motif in motifs)
+            result["family_scores"][family] = family_score
+
+        return result
+
+    def get_all_motifs(self):
+        """Get all motifs (known and novel)."""
+        all_motifs = {}
+        # Include known motifs
+        for motif, data in self.motif_anchors.items():
+            all_motifs[motif] = {
+                "consensus": data["consensus"],
+                "family": data["family"],
+                "weight": data["weight"],
+                "variants": data["variants"],
+                "is_novel": False,
+            }
+
+        # Include novel motifs
+        for motif, data in self.novel_motifs.items():
+            all_motifs[motif] = {
+                "consensus": data["consensus"],
+                "family": data["family"],
+                "weight": data["weight"],
+                "variants": data["variants"],
+                "is_novel": True,
+            }
+
+        return all_motifs
+
+    def get_motifs_by_family(self):
+        """Get motifs organized by family."""
+        return self.motif_families
+
+    def visualize_motif_network(self, output_file=None):
+        """
+        Visualize the motif similarity network.
+        Requires networkx and matplotlib.
+        """
+        try:
+            import networkx as nx
+            import matplotlib.pyplot as plt
+
+            G = nx.Graph()
+
+            # Add all motifs as nodes
+            for motif, data in self.motif_anchors.items():
+                G.add_node(
+                    motif,
+                    family=data["family"],
+                    type="known",
+                    weight=data["weight"],
+                    size=len(data["variants"]),
+                )
+
+            for motif, data in self.novel_motifs.items():
+                G.add_node(
+                    motif,
+                    family=data["family"],
+                    type="novel",
+                    weight=data["weight"],
+                    size=len(data["variants"]),
+                )
+
+            # Add edges based on similarity
+            all_motifs = {**self.motif_anchors, **self.novel_motifs}
+            motif_list = list(all_motifs.keys())
+
+            for i in range(len(motif_list)):
+                for j in range(i + 1, len(motif_list)):
+                    motif1 = motif_list[i]
+                    motif2 = motif_list[j]
+                    vec1 = all_motifs[motif1]["vector"]
+                    vec2 = all_motifs[motif2]["vector"]
+                    sim = float(self.hdc.hdc.similarity(vec1, vec2))
+                    if sim > self.similarity_threshold:
+                        G.add_edge(motif1, motif2, weight=sim)
+
+            # Plot the network
+            plt.figure(figsize=(12, 10))
+
+            # Set node colors by family
+            families = list(set(nx.get_node_attributes(G, "family").values()))
+            color_map = plt.cm.get_cmap("tab20", len(families))
+            family_colors = {family: color_map(i) for i, family in enumerate(families)}
+
+            node_colors = [family_colors[G.nodes[n]["family"]] for n in G.nodes()]
+            node_sizes = [G.nodes[n]["size"] * 100 for n in G.nodes()]
+
+            # Create layout
+            pos = nx.spring_layout(G, k=0.3, iterations=50)
+
+            # Draw network
+            nx.draw_networkx_nodes(
+                G, pos, node_color=node_colors, node_size=node_sizes, alpha=0.8
+            )
+            nx.draw_networkx_edges(G, pos, alpha=0.5)
+            nx.draw_networkx_labels(G, pos, font_size=8)
+
+            plt.title("Motif Similarity Network")
+            plt.axis("off")
+
+            # Add legend for families
+            handles = [
+                plt.Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    markerfacecolor=color,
+                    markersize=10,
+                    label=family,
+                )
+                for family, color in family_colors.items()
+            ]
+            plt.legend(
+                handles=handles, title="Motif Families", loc="lower right", ncol=2
+            )
+
+            if output_file:
+                plt.savefig(output_file, dpi=300, bbox_inches="tight")
+            plt.show()
+
+        except ImportError as e:
+            print(f"Visualization requires networkx and matplotlib: {e}")
+            return None
+
+    def cluster_motifs(self, motifs):
+        """Cluster motifs using distance metrics (Mahalanobis or Hyperbolic)."""
+        clusters = []
+        for i, motif1 in enumerate(motifs):
+            cluster = []
+            for j, motif2 in enumerate(motifs):
+                if i != j:
+                    # Calculate Mahalanobis or Hyperbolic distance between motifs
+                    mahalanobis_dist = self._calculate_mahalanobis(motif1, motif2)
+                    hyperbolic_dist = self._hyperbolic_distance(motif1, motif2)
+
+                    # Apply a distance threshold for clustering
+                    if mahalanobis_dist < 1.0 or hyperbolic_dist < 1.0:
+                        cluster.append(motif2)
+            clusters.append(cluster)
+
+        # Organize motifs into families
+        motif_families = self._group_motifs_by_family(clusters)
+        return motif_families
+
+    def _group_motifs_by_family(self, clusters):
+        """Group motifs into families based on distance-based clustering."""
+        motif_families = {}
+        for cluster in clusters:
+            # Calculate consensus for this cluster
+            consensus = self._derive_consensus(cluster)
+            family = self._guess_motif_family(consensus)
+
+            # Create or update motif family
+            if family not in motif_families:
+                motif_families[family] = []
+            motif_families[family].append(consensus)
+
+        return motif_families
+
+    def _calculate_mahalanobis(self, motif1, motif2):
+        """Calculate the Mahalanobis distance between two motifs."""
+        diff = motif1 - motif2
+        cov_matrix = torch.cov(torch.stack([motif1, motif2], dim=1).T)
+        inv_cov_matrix = torch.linalg.inv(cov_matrix)
+        mahalanobis_dist = torch.sqrt(
+            torch.matmul(torch.matmul(diff.T, inv_cov_matrix), diff)
+        )
+        return float(mahalanobis_dist)
+
+    def _hyperbolic_distance(self, motif1, motif2):
+        """Calculate hyperbolic distance between two motifs."""
+        x_norm = torch.norm(motif1)
+        y_norm = torch.norm(motif2)
+        x_p = motif1 / (1 + torch.sqrt(1 + x_norm**2))
+        y_p = motif2 / (1 + torch.sqrt(1 + y_norm**2))
+        inner_term = -2 * torch.sum(x_p * y_p)
+        return torch.acosh(1 + inner_term)
 
 
 class DNASupercomputer:
@@ -735,7 +2089,8 @@ class DNASupercomputer:
         return [(reference_seqs[i], all_similarities[i]) for i in top_indices]
 
     def analyze_sequence(self, sequence):
-        """Analyze sequence properties using Utils."""
+        """Analyze sequence properties using advanced HDC motif discovery."""
+        # Initialize basic stats
         stats = {}
         stats["length"] = len(sequence)
         stats["gc_content"] = Utils.calculate_gc_content(sequence)
@@ -744,11 +2099,29 @@ class DNASupercomputer:
             stats["entropy"] / math.log2(4) if stats["entropy"] > 0 else 0
         )
         stats["optimal_k"] = Utils.detect_optimal_kmer_size(sequence)
-        common_motifs = ["TATA", "GATA", "CAAT", "AATAAA", "GCCNNNGGC"]
-        motif_positions = Utils.detect_motifs(sequence, common_motifs)
-        stats["motif_positions"] = [
-            (pos, 0.7) for motif in motif_positions for pos in motif_positions[motif]
-        ]
+
+        # Lazy-load our motif discovery system
+        if not hasattr(self, "motif_discovery"):
+            self.motif_discovery = HDCMotifDiscovery(self)
+
+        # Get comprehensive motif analysis
+        motif_results = self.motif_discovery.score_sequence(sequence)
+
+        # Extract motif positions with scores
+        stats["motif_positions"] = []
+        for motif, positions in motif_results["motif_positions"].items():
+            for pos, score in positions:
+                stats["motif_positions"].append((pos, score, motif))
+
+        # Add motif enrichment scores
+        stats["motif_scores"] = motif_results["motif_scores"]
+        stats["motif_families"] = motif_results["family_scores"]
+
+        # Add top motifs for quick reference
+        top_motifs = sorted(
+            motif_results["motif_scores"].items(), key=lambda x: x[1], reverse=True
+        )[:5]
+        stats["top_motifs"] = [m for m, s in top_motifs if s > 0]
 
         return stats
 
@@ -857,28 +2230,186 @@ class DNASupercomputer:
 
 @dataclass
 class FeatureProvider:
-    """Represents a biological feature provider."""
+    """Represents a biological feature provider.
+
+    Args:
+        name: Name of the feature provider (e.g., "tfbs", "gc_content").
+        provider_fn: Function to compute the feature vector for a given k-mer or position.
+        weight: Weight of this feature in the final vector.
+        data: Optional data required for the feature provider (e.g., TFBS positions).
+    """
 
     name: str
-    provider_fn: Callable[[str, Optional[int]], Any]
+    provider_fn: Optional[Callable[[str, Optional[int]], Any]] = None
     weight: float = 1.0
+    data: Optional[Dict[str, Any]] = field(default_factory=dict)
+
+    def compute_feature(
+        self, kmer: str, position: Optional[int] = None
+    ) -> Optional[Any]:
+        """Compute the feature vector for a given k-mer and position."""
+        if self.provider_fn is not None:
+            return self.provider_fn(kmer, position)
+        elif self.name == "tfbs":
+            return self._compute_tfbs(kmer, position)
+        else:
+            raise NotImplementedError(
+                f"No provider function defined for feature: {self.name}"
+            )
+
+    def _compute_tfbs(self, kmer: str, position: Optional[int] = None) -> Optional[Any]:
+        """Compute TFBS feature vector for a k-mer."""
+        if position is None:
+            return None
+
+        # Check if the k-mer overlaps with any TFBS
+        tfbs_scores = {}
+        for tf, sites in self.data.get("tfbs_data", {}).items():
+            for start, end in sites:
+                if start <= position < end:
+                    tfbs_scores[tf] = (
+                        1.0  # Binary score (1 if overlapping, 0 otherwise)
+                    )
+
+        if not tfbs_scores:
+            return None
+
+        # Create a feature vector based on TFBS scores
+        feature_vector = np.zeros(self.data.get("dim", 1000))  # Default dimension
+        for tf, score in tfbs_scores.items():
+            seed_val = hash(tf) % 10000  # Consistent seeding
+            np.random.seed(seed_val)
+            tf_vec = np.random.uniform(-1, 1, self.data.get("dim", 1000))
+            feature_vector += tf_vec * score
+
+        return feature_vector / np.linalg.norm(feature_vector)  # Normalize
 
 
 class BiologicalEncoder:
-    """HDC encoder integrating biological features, now without inheritance."""
-
     def __init__(self, config: GSCConfig):
         self.config = config
-        self.hdc = HDCVectorSpace(config)  # Composition instead of inheritance
+        self.hdc = HDCVectorSpace(config)
         self.feature_providers: Dict[str, FeatureProvider] = {}
-        self.feature_cache: Dict[Tuple[str, Optional[int]], Any] = {}  # Feature cache
+        self.feature_cache: Dict[
+            Tuple[str, Optional[int]], Any
+        ] = {}  # Feature cache, str for kmer
         self.kmer_cache = lru_cache(maxsize=self.config.cache_size)(
             self._encode_kmer_uncached
         )
-        self.data_loader = GenomicDataLoader()  # Initialize the GenomicDataLoader
-        self.utils = Utils()  # Initialize the Utils class
+        self.data_loader = GenomicDataLoader()
+        self.utils = Utils()  # Access the utility functions
         self._register_default_features()
-        self.hdc.initialize()  # Initialize after setting up base vectors
+        self.hdc.initialize()  # Initialize HDC vectors
+        self.filters = {}  # Initialize filters, used for convolutional method of encoding sequences
+
+    def initialize_filters(self, filter_motifs: Optional[List[str]] = None):
+        """
+        Initializes the convolutional filters.  If filter_motifs is provided,
+        the filters are initialized with the HDC vectors of those motifs.
+        Otherwise, filters are initialized randomly.
+
+        Args:
+            filter_motifs: A list of motifs (strings) to use for initializing
+                           the filters.  If None, random filters are created.
+        """
+        if filter_motifs:
+            for motif in filter_motifs:
+                self.filters[motif] = self.hdc.encode_sequence(
+                    motif
+                )  # Use encode_sequence, not encode_kmer
+        else:
+            # Create random filters.  You might want to adjust the number and
+            # length of random filters. A good starting point is to have
+            # filters that are similar in length to common motifs.
+            num_random_filters = 10
+            for i in range(num_random_filters):
+                filter_len = self.utils.detect_optimal_kmer_size(
+                    "".join(random.choices("ACGT", k=10))
+                )  # Random length between 5 and 15
+                random_motif = "".join(
+                    self.hdc.xp.random.choice(
+                        list(self.hdc.base_vectors.keys()), size=filter_len
+                    )
+                )
+                self.filters[f"random_{i}"] = self.hdc.encode_sequence(random_motif)
+
+    def encode_sequence_convolutional(
+        self, sequence: str, pooling_window: int = 4
+    ) -> Any:
+        """
+        Encodes a DNA sequence using a convolutional HDC approach.
+
+        Args:
+            sequence: The DNA sequence to encode (string).
+            pooling_window: The size of the window for max pooling.
+
+        Returns:
+            The HDC vector representing the sequence (NumPy or CuPy array).
+        """
+        xp = self.hdc.xp
+
+        if not sequence:
+            return xp.zeros(self.hdc.dim, dtype=xp.float32)  # Handle empty sequence
+
+        # 1.  Base Encoding (with Circular Shift for Position)
+        base_vectors = []
+        for i, base in enumerate(sequence):
+            base_vector = self.utils.handle_ambiguous_base(
+                base, self.hdc
+            )  # Use Utils for ambiguous bases
+            if base_vector is not None:
+                encoded_base = self.hdc.circular_shift(base_vector, i)
+                base_vectors.append(encoded_base)
+
+        if not base_vectors:
+            return xp.zeros(
+                self.hdc.dim, dtype=xp.float32
+            )  # Handle all-ambiguous-bases
+
+        # 2. Convolution with Filters
+        feature_maps = {}
+        for filter_name, filter_vector in self.filters.items():
+            feature_map = self.hdc.convolve(
+                base_vectors, filter_vector
+            )  # use the convolve function
+            feature_maps[filter_name] = feature_map
+
+        # 3. Max Pooling
+        pooled_maps = {}
+        for filter_name, feature_map in feature_maps.items():
+            pooled_map = self.hdc.max_pool(feature_map, window_size=pooling_window)
+            if not pooled_map:  # Handle the case where pooling results in an empty list (sequence shorter than window)
+                pooled_maps[filter_name] = [0.0]  # Use 0 as default
+            else:
+                pooled_maps[filter_name] = pooled_map
+
+        # 4. Bundling (Weighted Sum of Pooled Feature Maps)
+        # Convert pooled maps to HDC vectors, handling potential empty maps.
+        pooled_vectors = []
+        for filter_name, pooled_map in pooled_maps.items():
+            if pooled_map:  # Should always be true now, but good to keep checking.
+                pooled_vector = xp.array(pooled_map, dtype=xp.float32)
+                if pooled_vector.ndim == 1:  # If it is 1D, make 2D
+                    pooled_vector = xp.expand_dims(pooled_vector, axis=0)
+                if pooled_vector.shape[1] < self.hdc.dim:  # Pad if needed
+                    padding_size = self.hdc.dim - pooled_vector.shape[1]
+                    padding = xp.zeros((1, padding_size), dtype=xp.float32)
+                    pooled_vector = xp.concatenate((pooled_vector, padding), axis=1)
+                elif pooled_vector.shape[1] > self.hdc.dim:  # Truncate
+                    pooled_vector = pooled_vector[:, : self.hdc.dim]
+                pooled_vectors.append(
+                    self.hdc._normalize(pooled_vector[0])
+                )  # Back to 1D
+
+        if (
+            not pooled_vectors
+        ):  # Handle the case where all filters resulted in empty pooled maps
+            return xp.zeros(self.hdc.dim, dtype=xp.float32)
+
+        # Stack, then bundle
+        stacked_vectors = xp.stack(pooled_vectors)
+        result = xp.sum(stacked_vectors, axis=0)
+        return self.hdc._normalize(result)
 
     def _register_default_features(self):
         """Register default feature providers."""
@@ -889,8 +2420,8 @@ class BiologicalEncoder:
             FeatureProvider("complexity", self._compute_complexity, 0.3)
         )
         self.register_feature_provider(
-            FeatureProvider("motifs", self._detect_motifs, 0.4)  # Local motifs
-        )
+            FeatureProvider("motifs", self._detect_motifs, 0.4)
+        )  # Local motifs
 
     def register_feature_provider(self, provider: FeatureProvider):
         """Register a feature provider."""
@@ -899,23 +2430,52 @@ class BiologicalEncoder:
             f"Registered feature provider: {provider.name} with weight {provider.weight}"
         )
 
-    def _compute_gc_content(self, kmer: str, position: Optional[int] = None) -> float:
+    def _compute_gc_content(
+        self, kmer: str, position: Optional[int] = None
+    ) -> float:  # Added position
         """Compute GC content using Utils."""
         return self.utils.calculate_gc_content(kmer)
 
-    def _compute_complexity(self, kmer: str, position: Optional[int] = None) -> float:
+    def _compute_complexity(
+        self, kmer: str, position: Optional[int] = None
+    ) -> float:  # Added position
         """Compute Shannon entropy using Utils."""
         return self.utils.calculate_sequence_entropy(kmer)
 
-    @lru_cache(maxsize=128)  # Cache motif detection
+    @lru_cache(maxsize=128)
     def _detect_motifs(self, kmer: str, position: Optional[int] = None) -> float:
-        """Detect common motifs using Utils."""
-        motif_list = list(COMMON_MOTIFS.keys())
-        motif_positions = self.utils.detect_motifs(kmer, motif_list)
-        if not motif_positions:
+        """Detect motifs using HDC-powered motif discovery."""
+        # Lazy-load our motif discovery system
+        if not hasattr(self, "motif_discovery"):
+            self.motif_discovery = HDCMotifDiscovery(self)
+
+        # For short k-mers, do quick scoring against known motifs
+        if len(kmer) < 15:
+            kmer_vec = self.encode_kmer(kmer)
+
+            # Score against all motifs (known + novel)
+            best_score = 0.0
+
+            # Check all motifs from both known and novel collections
+            all_motifs = {
+                **self.motif_discovery.motif_anchors,
+                **self.motif_discovery.novel_motifs,
+            }
+            for _, data in all_motifs.items():
+                sim = float(self.hdc.similarity(kmer_vec, data["vector"]))
+                weighted_score = sim * data["weight"]
+                best_score = max(best_score, weighted_score)
+
+            # Return the score only if above threshold
+            return best_score if best_score > 0.4 else 0.0
+
+        # For longer sequences, use the fuller scoring approach
+        score_results = self.motif_discovery.score_sequence(kmer)
+        if not score_results["motif_scores"]:
             return 0.0
-        # Return the highest motif score
-        return max(COMMON_MOTIFS[motif] for motif in motif_positions.keys())
+
+        # Get the highest motif score
+        return max(score_results["motif_scores"].values())
 
     def _compute_feature_vector(
         self, kmer: str, position: Optional[int] = None
@@ -974,7 +2534,9 @@ class BiologicalEncoder:
             return self.hdc.base_vectors[kmer]
 
         # 1. Base k-mer encoding (using HDCVectorSpace's methods)
-        base_vector = self.hdc.encode_kmer(kmer)
+        base_vector = self.utils.encode_kmer_basic(
+            kmer, self.hdc
+        )  # Use Utils for basic encoding
 
         # 2. Integrate biological features
         feature_vector = self._compute_feature_vector(kmer, position)
@@ -989,51 +2551,6 @@ class BiologicalEncoder:
     def encode_kmer(self, kmer: str, position: Optional[int] = None) -> Any:
         """Encode k-mer (using cache)."""
         return self.kmer_cache(kmer, position)
-
-    def encode_sequence(
-        self,
-        sequence: str,
-        k: Optional[int] = None,
-        stride: Optional[int] = None,
-        chunk_size: Optional[int] = None,
-    ) -> Any:
-        """Encode sequence with biological features."""
-        k = k or self.utils.detect_optimal_kmer_size(sequence)
-        stride = stride or max(1, k // 3)
-        chunk_size = chunk_size or self.config.chunk_size
-        xp = self.hdc.xp
-        if len(sequence) < k:
-            return self.encode_kmer(sequence)
-
-        result = xp.zeros(self.hdc.dim, dtype=xp.float32)
-        n_kmers = 0
-        for chunk_start in range(0, len(sequence), chunk_size):
-            chunk_end = min(chunk_start + chunk_size + k - 1, len(sequence))
-            chunk = sequence[chunk_start:chunk_end]
-            kmers = self.utils.generate_kmers(chunk, k, stride)
-            chunk_vectors = []
-
-            for i, kmer in enumerate(kmers):
-                if kmer.count("N") <= k // 3:
-                    position = chunk_start + (i * stride)
-                    kmer_vector = self.encode_kmer(kmer, position)
-                    chunk_vectors.append(kmer_vector)
-
-            if chunk_vectors:  # Combine chunk vectors with weighted average
-                stacked = xp.array(chunk_vectors)
-                weights = xp.array(
-                    [self.config.bundle_decay**i for i in range(len(chunk_vectors))]
-                )
-                weights /= weights.sum()  # Normalize
-                chunk_result = xp.sum(stacked * weights.reshape(-1, 1), axis=0)
-                result = self.hdc.bundle(result, chunk_result, self.config.bundle_decay)
-                n_kmers += len(chunk_vectors)
-
-        return (
-            self.hdc._normalize(result)
-            if n_kmers > 0
-            else xp.zeros(self.hdc.dim, dtype=xp.float32)
-        )
 
     def _optimal_kmer_size(self, sequence: str) -> int:
         """Determine optimal k-mer size using Utils."""
@@ -1238,13 +2755,7 @@ class DNAEncoder:
 
     def _encode_kmer_uncached(self, kmer: str, position: Optional[int] = None) -> Any:
         """Core k-mer encoding logic (uncached)."""
-        if len(kmer) == 1 and kmer in self.hdc.base_vectors:
-            return self.hdc.base_vectors[kmer]
-        return (
-            self.hdc._encode_clean_kmer(kmer)
-            if all(base in self.hdc.base_vectors for base in kmer)
-            else self.hdc._encode_ambiguous_kmer(kmer)
-        )
+        return self.utils.encode_kmer_basic(kmer, self.hdc)  # Use Utils
 
     def encode_kmer(self, kmer: str, position: Optional[int] = None) -> Any:
         """Encode a k-mer (using cache)."""
@@ -1277,7 +2788,7 @@ class DNAEncoder:
         for chunk_start in range(0, len(sequence), chunk_size):
             chunk_end = min(chunk_start + chunk_size + k - 1, len(sequence))
             chunk = sequence[chunk_start:chunk_end]
-            kmers = self.utils.generate_kmers(chunk, k, stride)
+            kmers = self.utils.generate_kmers(chunk, k, stride)  # Use Utils
             chunk_vectors = [
                 self.encode_kmer(kmer) for kmer in kmers if kmer.count("N") <= k // 3
             ]
@@ -1945,7 +3456,7 @@ class FeatureMetrics:
 
 
 class GeneticSwarm:
-    """HDC-powered swarm intelligence for genetic sequence analysis."""
+    """A true swarm intelligence system for genetic sequence analysis using HDC space navigation."""
 
     def __init__(
         self, supercomputer: "HDCVectorSpace", config: Optional[SwarmConfig] = None
@@ -1954,186 +3465,202 @@ class GeneticSwarm:
         self.xp = supercomputer.xp
         self.config = config or SwarmConfig()
 
-        # Initialize swarm components
+        # Core swarm components
         self.agents: List[GeneticAgent] = []
-        self.weights: Dict[int, float] = {}
-        self.convergence = 0.0
-        self.feature_cache = {}
+        self.positions: List[Any] = []  # Agent positions in HDC space
+        self.past_updates: List[Any] = []  # Past movement vectors for sign matching
+        self.local_fields: List[Any] = []  # Local sequence field each agent senses
+        self.specializations: Dict[int, str] = {}  # Track what each agent gets good at
 
-        # Performance tracking
-        self.rewards = []
-        self.history = {"train": [], "val": []}
+        # Adaptive weights
+        self.weights = {}  # Dynamic agent influence weights
+        self.success_rates = defaultdict(list)  # Track prediction success by region
+
+        # Global swarm state
+        self.attractor = None  # Current sequence attractor state
         self.epoch = 0
+        self.convergence = 0.0
 
     def initialize_swarm(self, sequences: Optional[List[str]] = None) -> None:
-        """Initialize swarm with data-driven agent distribution."""
+        """Create a diverse swarm with different specializations."""
         distribution = (
             self._analyze_distribution(sequences)
             if sequences
             else self._default_distribution()
         )
 
-        # Create agents based on distribution
-        agent_id = 0
         for agent_type, count in distribution.items():
             for _ in range(count):
-                agent = GeneticAgent(
-                    self.sc,
-                    agent_type=agent_type,
-                    config=AgentConfig(agent_type=agent_type),
-                )
+                # Create agent with its initial HDC space position
+                agent = GeneticAgent(self.sc, agent_type=agent_type)
+                initial_pos = self.sc.hdc._random_vector()
+
+                # Initialize agent's local sensing field
+                field_size = self.config.window_size
+                local_field = self.xp.zeros((field_size, self.sc.hdc.dim))
+
                 self.agents.append(agent)
-                self.weights[agent_id] = 0.5
-                agent_id += 1
+                self.positions.append(initial_pos)
+                self.past_updates.append(self.xp.zeros_like(initial_pos))
+                self.local_fields.append(local_field)
+                self.weights[len(self.agents) - 1] = 1.0 / len(self.agents)
+                self.specializations[len(self.agents) - 1] = str(agent_type)
 
         if sequences:
-            self._adapt_to_sequences(sequences)
+            self._adapt_to_sequences(sequences[:5])  # Quick initial adaptation
 
-    def _analyze_distribution(
-        self, sequences: List[str]
-    ) -> Dict[AgentConfig.Type, int]:
-        """Determine optimal agent distribution from sequence characteristics."""
-        if len(sequences) < 3:
-            return self._default_distribution()
+    def _swarm_step(self, target_vector: Any, epsilon: float = 0.1) -> None:
+        """Execute one step of swarm movement in HDC space."""
+        sign_matches = []
+        new_positions = []
+        new_updates = []
 
-        # Analyze sequence features
-        metrics = self._compute_sequence_metrics(sequences[:10])
+        # Calculate repulsion between agents
+        repulsions = defaultdict(list)
+        for i, pos_i in enumerate(self.positions):
+            for j, pos_j in enumerate(self.positions):
+                if i != j:
+                    dist = float(self.xp.dot(pos_i, pos_j))
+                    if dist > 0.8:  # Too close
+                        repulsions[i].append((pos_i - pos_j) * 0.1)
 
-        # Map features to agent types
-        type_scores = {
-            AgentConfig.Type.MOTIF_DETECTOR: metrics.motifs,
-            AgentConfig.Type.STRUCTURE_ANALYZER: metrics.structure,
-            AgentConfig.Type.CONSERVATION_TRACKER: metrics.conservation,
-            AgentConfig.Type.CODON_SPECIALIST: metrics.coding,
-            AgentConfig.Type.BOUNDARY_FINDER: metrics.boundary,
-            AgentConfig.Type.GENERALIST: 0.1,  # Always keep some generalists
-        }
+        # Update each agent's position
+        for i, (pos, past_update) in enumerate(zip(self.positions, self.past_updates)):
+            # Get current gradient to target
+            grad = target_vector - pos
 
-        return self._allocate_agents(type_scores)
+            # LION-style sign matching
+            sign_match = self.xp.sign(grad) == self.xp.sign(past_update)
+            sign_matches.append(float(self.xp.mean(sign_match)))
 
-    def _compute_sequence_metrics(self, sequences: List[str]) -> FeatureMetrics:
-        """Compute feature metrics for sequences using vectorized operations."""
-        metrics = FeatureMetrics()
+            # Compute update with sign-based confidence
+            base_update = self.xp.where(
+                sign_match,
+                self.xp.sign(grad) * 0.1,  # Confident step
+                self.xp.sign(grad) * 0.02,  # Cautious step
+            )
 
-        for seq in sequences:
-            if len(seq) < 30:
-                continue
+            # Add repulsion and local field influence
+            repulsion = sum(repulsions[i]) if i in repulsions else 0
+            field_influence = self.xp.mean(self.local_fields[i], axis=0) * 0.05
 
-            # Vectorized feature extraction
-            windows = [
-                seq[i : i + self.config.window_size]
-                for i in range(
-                    0, len(seq) - self.config.window_size, self.config.stride
-                )
-            ]
+            # Combine all influences
+            update = base_update + repulsion + field_influence
+            update = self.xp.clip(update, -0.15, 0.15)  # Limit step size
 
-            if not windows:
-                continue
+            # Update position and history
+            new_pos = pos + update
+            new_positions.append(self.sc.hdc._normalize(new_pos))
+            new_updates.append(grad)
 
-            # Compute features in parallel using HDC operations
-            features = self._extract_features_batch(windows)
-            for feature_type in metrics.__dataclass_fields__:
-                current = getattr(metrics, feature_type)
-                setattr(
-                    metrics,
-                    feature_type,
-                    current + np.mean([f.get(feature_type, 0) for f in features]),
-                )
+            # Update agent's local field
+            self.local_fields[i] = self.xp.roll(self.local_fields[i], -1, axis=0)
+            self.local_fields[i][-1] = target_vector
 
-        return metrics.normalize()
+        # Update swarm state
+        self.positions = new_positions
+        self.past_updates = new_updates
+        self.convergence = float(self.xp.mean(sign_matches))
+
+        # Adapt weights based on position quality
+        self._adapt_weights()
 
     def predict_sequence(self, context: str, length: int, epsilon: float = 0.05) -> str:
-        """Generate sequence prediction using swarm consensus."""
+        """Generate sequence using collective swarm intelligence."""
         state = self.sc.encode_sequence(context)
+        self.attractor = state  # Set global attractor
         result = []
 
         for _ in range(length):
+            # Move swarm to current state
+            self._swarm_step(state, epsilon)
+
             # Get weighted predictions from all agents
             predictions = defaultdict(float)
-            for agent in self.agents:
-                base = agent.predict_base(state, epsilon)
-                weight = self.weights[agent.id] * agent.confidence
+            for i, agent in enumerate(self.agents):
+                # Each agent predicts based on its local view
+                base = agent.predict_base(self.positions[i], epsilon)
+
+                # Weight by position quality and historic success
+                weight = self.weights[i] * (1 + len(self.success_rates[i]) / 100)
                 predictions[base] += weight
 
             # Select best base and update state
             next_base = max(predictions.items(), key=lambda x: x[1])[0]
             result.append(next_base)
 
-            # Update state vector using latest context
+            # Update swarm's global state
             kmer = "".join(result[-7:])
             next_vec = self.sc.encode_kmer(kmer)
             state = self.sc.bundle(state, next_vec, alpha=0.7)
+            self.attractor = state
 
         return "".join(result)
 
-    def impute_segment(self, prefix: str, suffix: str, length: int) -> str:
-        """Impute missing segment using beam search and swarm consensus."""
-        if not prefix and not suffix:
-            return "N" * length
+    def _adapt_weights(self) -> None:
+        """Dynamically adjust agent influence based on position quality and specialization."""
+        total_influence = 0
 
-        # Initialize beam with prefix context
-        context = prefix[-10:] if len(prefix) > 10 else prefix
-        beam = [
-            (self.predict_sequence(context, length, epsilon=0.01 + i * 0.05), 0.0)
-            for i in range(self.config.beam_width)
-        ]
+        # Calculate each agent's influence based on position and track record
+        for i, pos in enumerate(self.positions):
+            # How well this agent aligns with current sequence context
+            alignment = float(self.xp.dot(pos, self.attractor))
 
-        if not suffix:
-            return beam[0][0]
+            # Boost influence if agent has consistent prediction success
+            success_history = (
+                len(self.success_rates[i]) / 100 if self.success_rates[i] else 0
+            )
 
-        # Score candidates using suffix similarity
-        suffix_vec = self.sc.encode_sequence(suffix[:10])
-        scored_candidates = [
-            (cand, float(self.xp.dot(self.sc.encode_sequence(cand), suffix_vec)))
-            for cand, _ in beam
-        ]
+            # Combine into single influence score
+            self.weights[i] = alignment * (1 + success_history)
+            total_influence += self.weights[i]
 
-        return max(scored_candidates, key=lambda x: x[1])[0]
+        # Normalize into probability distribution
+        if total_influence > 0:
+            self.weights = {i: w / total_influence for i, w in self.weights.items()}
 
-    def train(
-        self, sequences: List[str], epochs: int = 5, val_set: Optional[List[str]] = None
-    ) -> Dict:
-        """Train swarm using parallelized sequence processing."""
+    def train(self, sequences: List[str], epochs: int = 5) -> Dict:
+        """Train swarm through sequence exploration."""
+        history = []
+
         for epoch in range(epochs):
-            self.epoch += 1
-
-            # Process sequences in parallel batches
-            rewards = []
+            epoch_reward = 0
             for seq in sequences:
                 if len(seq) < 30:
                     continue
 
-                reward = self._train_sequence(seq)
-                rewards.append(reward)
+                # Initialize sequence state
+                state = self.sc.encode_sequence(seq[:10])
+                self.attractor = state
 
-            # Update agent weights and track performance
-            self._update_weights()
-            avg_reward = np.mean(rewards) if rewards else 0
-            self.history["train"].append(avg_reward)
+                # Process sequence in chunks
+                for i in range(10, len(seq) - 5, 5):
+                    target = seq[i : i + 5]
+                    target_vec = self.sc.encode_sequence(target)
 
-            if val_set:
-                val_acc = self.evaluate(val_set)
-                self.history["val"].append(val_acc)
+                    # Move swarm
+                    self._swarm_step(target_vec)
 
-        return {"final_reward": self.history["train"][-1], "history": self.history}
+                    # Train agents
+                    chunk_reward = 0
+                    for j, agent in enumerate(self.agents):
+                        reward = agent.train_on_segment(self.positions[j], target)
+                        chunk_reward += reward * self.weights[j]
 
-    def _train_sequence(self, sequence: str) -> float:
-        """Train all agents on a single sequence using HDC operations."""
-        total_reward = 0
-        state = self.sc.encode_sequence(sequence[:10])
+                        # Track successful predictions
+                        if reward > 0.5:
+                            self.success_rates[j].append(1)
+                        if len(self.success_rates[j]) > 100:
+                            self.success_rates[j] = self.success_rates[j][-100:]
 
-        for i in range(10, len(sequence) - 5, 5):
-            target = sequence[i : i + 5]
+                    epoch_reward += chunk_reward
+                    state = self.sc.encode_sequence(seq[i : i + 10])
+                    self.attractor = state
 
-            # Train each agent
-            for agent in self.agents:
-                reward = agent.train_on_segment(state, target)
-                total_reward += reward
+            history.append(epoch_reward)
+            self.epoch += 1
 
-            # Update state
-            state = self.sc.encode_sequence(sequence[i : i + 10])
-
-        return total_reward / max(1, len(sequence) - 15)
+        return {"rewards": history, "convergence": self.convergence}
 
 
 class HDCGenomicUI:
@@ -2205,18 +3732,12 @@ class HDCGenomicUI:
             else:
                 vectors_np = vectors
 
-            # Compute pairwise similarities - USING vectors_np now!
+            # Compute pairwise similarities
             n_seqs = len(sequences)
             sim_matrix = np.zeros((n_seqs, n_seqs))
             for i in range(n_seqs):
                 for j in range(i, n_seqs):
-                    # Use vectors_np instead of vectors
-                    if self.sc.hdc.device == "gpu":
-                        sim = float(np.dot(vectors_np[i], vectors_np[j]))
-                    else:
-                        sim = float(
-                            self.sc.hdc.similarity(vectors_np[i], vectors_np[j])
-                        )
+                    sim = float(self.sc.hdc.similarity(vectors_np[i], vectors_np[j]))
                     sim_matrix[i, j] = sim
                     sim_matrix[j, i] = sim
 
@@ -2280,54 +3801,47 @@ class HDCGenomicUI:
 
             return stats_text, None, f"Used k-mer size: {k}"
 
-    def impute_sequence(self, prefix, suffix, gap_length):
+    def impute_sequence(self, prefix, suffix, gap_length, strategy="hdc"):
         """Fill in missing sequence between prefix and suffix"""
         if not prefix and not suffix:
             return "Need at least prefix or suffix to impute sequence"
 
-        # Create vectors for context
+        if strategy == "hdc":
+            # Use HDC-based imputation
+            return self._impute_hdc(prefix, suffix, gap_length)
+        elif strategy == "rl":
+            # Use reinforcement learning-based imputation
+            return self._impute_rl(prefix, suffix, gap_length)
+        else:
+            return "Invalid imputation strategy"
+
+    def _impute_hdc(self, prefix, suffix, gap_length):
+        """HDC-based imputation."""
         prefix_vec = self.sc.encode_sequence(prefix) if prefix else None
         suffix_vec = self.sc.encode_sequence(suffix) if suffix else None
 
-        # Simple imputation strategy (could be enhanced with the GeneticSwarm)
         if prefix and suffix:
-            # Use both contexts
             gap_length = int(gap_length) if gap_length else 10
-
-            # Generate 5 candidates using varied bundle weights
             candidates = []
             for alpha in [0.3, 0.4, 0.5, 0.6, 0.7]:
-                # Start with prefix context
                 result = []
                 state = prefix_vec
-
                 for _ in range(gap_length):
-                    # Predict next base using HDC similarity
                     scores = {}
                     for base in "ACGT":
                         base_vec = self.sc.hdc.base_vectors[base]
                         bound = self.sc.hdc.bind(state, base_vec)
-
-                        # Score by similarity to suffix context
                         if suffix_vec is not None:
-                            scores[base] = float(
-                                self.sc.hdc.similarity(bound, suffix_vec)
-                            )
+                            scores[base] = float(self.sc.hdc.similarity(bound, suffix_vec))
                         else:
-                            # If no suffix, use similarity to past context
                             scores[base] = float(self.sc.hdc.similarity(bound, state))
-
-                    # Choose best base
                     next_base = max(scores.items(), key=lambda x: x[1])[0]
                     result.append(next_base)
-
-                    # Update state with prefix context + new base
                     next_vec = self.sc.hdc.encode_kmer(next_base)
                     state = self.sc.hdc.bundle(state, next_vec, alpha=alpha)
-
                 candidates.append(("".join(result), alpha))
 
-            # Score candidates by compatibility with suffix
+            # Score candidates
             candidate_scores = []
             for seq, alpha in candidates:
                 cand_vec = self.sc.encode_sequence(seq)
@@ -2343,56 +3857,116 @@ class HDCGenomicUI:
 
             return result_text
 
-        elif prefix:
-            # Just predict continuation
-            gap_length = int(gap_length) if gap_length else 10
-            state = prefix_vec
-            result = []
+    def discover_motifs(self, sequence, motif_length, similarity_threshold):
+        """Discover motifs in a DNA sequence."""
+        if not sequence:
+            return "No sequence provided", None
 
-            for _ in range(gap_length):
-                scores = {}
-                for base in "ACGT":
-                    base_vec = self.sc.hdc.base_vectors[base]
-                    bound = self.sc.hdc.bind(state, base_vec)
-                    scores[base] = float(self.sc.hdc.similarity(bound, state))
+        motif_discovery = HDCMotifDiscovery(self.sc.hdc)
+        motifs = motif_discovery.discover_motifs([sequence], k_range=(motif_length, motif_length))
 
-                next_base = max(scores.items(), key=lambda x: x[1])[0]
-                result.append(next_base)
+        # Format results
+        result_text = "Discovered Motifs:\n"
+        for motif, data in motifs.items():
+            result_text += f"- {motif}: Score={data['weight']:.3f}, Family={data['family']}\n"
 
-                next_vec = self.sc.hdc.encode_kmer(next_base)
-                state = self.sc.hdc.bundle(state, next_vec, alpha=0.7)
+        # Visualize motifs
+        plt.figure(figsize=(12, 3))
+        for motif, data in motifs.items():
+            positions = data.get("positions", {}).get(0, [])
+            if positions:
+                plt.scatter(positions, [data["weight"]] * len(positions), label=motif)
+        plt.xlabel("Position")
+        plt.ylabel("Motif Score")
+        plt.title("Discovered Motifs")
+        plt.legend()
 
-            return f"Predicted continuation: {prefix}→{''.join(result)}"
+        motif_path = tempfile.mktemp(suffix=".png")
+        plt.tight_layout()
+        plt.savefig(motif_path)
+        plt.close()
 
-        else:  # suffix only
-            # Predict what might come before
-            gap_length = int(gap_length) if gap_length else 10
-            result = []
+        return result_text, Image.open(motif_path)
 
-            # This is trickier - we'll work backwards
-            state = suffix_vec
-            for _ in range(gap_length):
-                scores = {}
-                for base in "ACGT":
-                    base_vec = self.sc.hdc.base_vectors[base]
-                    # Position-binding to simulate reverse direction
-                    pos_vec = self.sc.hdc.position_vectors.get(
-                        "pos_0", self.sc.hdc.base_vectors[base]
-                    )
-                    bound = self.sc.hdc.bind(base_vec, pos_vec)
-                    bound = self.sc.hdc.bind(bound, state)
-                    scores[base] = float(self.sc.hdc.similarity(bound, state))
+    def analyze_variant(self, sequence, variant):
+        """Analyze the impact of a genetic variant."""
+        if not sequence or not variant:
+            return "No sequence or variant provided", None
 
-                prev_base = max(scores.items(), key=lambda x: x[1])[0]
-                result.insert(0, prev_base)
+        original_vec = self.sc.encode_sequence(sequence)
+        variant_vec = self.sc.encode_sequence(variant)
 
-                prev_vec = self.sc.hdc.encode_kmer(prev_base)
-                state = self.sc.hdc.bundle(prev_vec, state, alpha=0.3)
+        similarity = float(self.sc.hdc.similarity(original_vec, variant_vec))
+        impact_score = 1 - similarity
 
-            return f"Predicted prefix: {''.join(result)}→{suffix}"
+        # Visualize the impact
+        plt.figure(figsize=(8, 4))
+        plt.bar(["Original", "Variant"], [1.0, similarity])
+        plt.ylabel("Similarity")
+        plt.title(f"Variant Impact: {impact_score:.3f}")
+
+        variant_path = tempfile.mktemp(suffix=".png")
+        plt.tight_layout()
+        plt.savefig(variant_path)
+        plt.close()
+
+        return f"Variant Impact Score: {impact_score:.3f}", Image.open(variant_path)
+
+    def compare_sequences(self, sequences):
+        """Compare multiple sequences and identify conserved regions."""
+        if not sequences:
+            return "No sequences provided", None
+
+        vectors = [self.sc.encode_sequence(seq) for seq in sequences]
+
+        n_seqs = len(sequences)
+        sim_matrix = np.zeros((n_seqs, n_seqs))
+        for i in range(n_seqs):
+            for j in range(i, n_seqs):
+                sim_matrix[i, j] = float(self.sc.hdc.similarity(vectors[i], vectors[j]))
+                sim_matrix[j, i] = sim_matrix[i, j]
+
+        # Visualize similarity matrix
+        plt.figure(figsize=(10, 8))
+        plt.imshow(sim_matrix, cmap="viridis")
+        plt.colorbar(label="Similarity")
+        plt.title("Sequence Similarity Matrix")
+
+        comparison_path = tempfile.mktemp(suffix=".png")
+        plt.tight_layout()
+        plt.savefig(comparison_path)
+        plt.close()
+
+        return "Sequence comparison completed", Image.open(comparison_path)
+
+    def analyze_epigenetics(self, sequence, epigenetic_file):
+        """Analyze epigenetic data for a sequence."""
+        if not sequence or not epigenetic_file:
+            return "No sequence or epigenetic data provided", None
+
+        epigenetic_data = self.sc.data_loader.load_epigenetic_file(epigenetic_file)
+
+        sequence_vec = self.sc.encode_sequence(sequence)
+        epigenetic_vec = self.sc.encode_sequence(epigenetic_data.get("sequence", ""))
+
+        similarity = float(self.sc.hdc.similarity(sequence_vec, epigenetic_vec))
+
+        # Visualize epigenetic marks
+        plt.figure(figsize=(12, 3))
+        plt.plot(epigenetic_data.get("scores", []))
+        plt.xlabel("Position")
+        plt.ylabel("Epigenetic Score")
+        plt.title("Epigenetic Marks")
+
+        epigenetic_path = tempfile.mktemp(suffix=".png")
+        plt.tight_layout()
+        plt.savefig(epigenetic_path)
+        plt.close()
+
+        return f"Epigenetic Similarity: {similarity:.3f}", Image.open(epigenetic_path)
 
     def build_interface(self):
-        """Create the Gradio interface"""
+        """Create the Gradio interface."""
         with gr.Blocks(title="HDC Genomic Supercomputer") as app:
             gr.Markdown("# 🧬 HDC Genomic Supercomputer")
             gr.Markdown("Analyze DNA sequences using Hyperdimensional Computing")
@@ -2446,6 +4020,11 @@ class HDCGenomicUI:
                             step=1,
                             value=10,
                         )
+                        strategy = gr.Radio(
+                            label="Imputation Strategy",
+                            choices=["hdc", "rl"],
+                            value="hdc",
+                        )
                         impute_btn = gr.Button("Impute Missing Sequence")
 
                     with gr.Column():
@@ -2453,33 +4032,135 @@ class HDCGenomicUI:
 
                 impute_btn.click(
                     fn=self.impute_sequence,
-                    inputs=[prefix_input, suffix_input, gap_length],
+                    inputs=[prefix_input, suffix_input, gap_length, strategy],
                     outputs=[impute_output],
+                )
+
+            with gr.Tab("Motif Discovery"):
+                with gr.Row():
+                    with gr.Column():
+                        motif_sequence_input = gr.Textbox(
+                            label="Enter DNA sequence for motif discovery",
+                            placeholder="ATGCAAGTGCAATATTACGA...",
+                            lines=5,
+                        )
+                        motif_length = gr.Slider(
+                            label="Motif Length",
+                            minimum=4,
+                            maximum=20,
+                            step=1,
+                            value=6,
+                        )
+                        motif_threshold = gr.Slider(
+                            label="Similarity Threshold",
+                            minimum=0.5,
+                            maximum=1.0,
+                            step=0.05,
+                            value=0.8,
+                        )
+                        discover_btn = gr.Button("Discover Motifs")
+
+                    with gr.Column():
+                        motif_output = gr.Textbox(label="Motif Discovery Results", lines=10)
+                        motif_viz = gr.Image(label="Motif Visualization")
+
+                discover_btn.click(
+                    fn=self.discover_motifs,
+                    inputs=[motif_sequence_input, motif_length, motif_threshold],
+                    outputs=[motif_output, motif_viz],
+                )
+
+            with gr.Tab("Variant Analysis"):
+                with gr.Row():
+                    with gr.Column():
+                        variant_sequence_input = gr.Textbox(
+                            label="Enter DNA sequence",
+                            placeholder="ATGCAAGTGCAATATTACGA...",
+                            lines=5,
+                        )
+                        variant_input = gr.Textbox(
+                            label="Enter variant (e.g., A10G)",
+                            placeholder="A10G",
+                        )
+                        analyze_variant_btn = gr.Button("Analyze Variant")
+
+                    with gr.Column():
+                        variant_output = gr.Textbox(label="Variant Analysis Results", lines=10)
+                        variant_viz = gr.Image(label="Variant Impact Visualization")
+
+                analyze_variant_btn.click(
+                    fn=self.analyze_variant,
+                    inputs=[variant_sequence_input, variant_input],
+                    outputs=[variant_output, variant_viz],
+                )
+
+            with gr.Tab("Comparative Genomics"):
+                with gr.Row():
+                    with gr.Column():
+                        comparison_input = gr.Textbox(
+                            label="Enter sequences (one per line)",
+                            placeholder="Sequence 1\nSequence 2\n...",
+                            lines=10,
+                        )
+                        compare_btn = gr.Button("Compare Sequences")
+
+                    with gr.Column():
+                        comparison_output = gr.Textbox(label="Comparison Results", lines=10)
+                        comparison_viz = gr.Image(label="Similarity Matrix")
+
+                compare_btn.click(
+                    fn=self.compare_sequences,
+                    inputs=[comparison_input],
+                    outputs=[comparison_output, comparison_viz],
+                )
+
+            with gr.Tab("Epigenetic Analysis"):
+                with gr.Row():
+                    with gr.Column():
+                        epigenetic_sequence_input = gr.Textbox(
+                            label="Enter DNA sequence",
+                            placeholder="ATGCAAGTGCAATATTACGA...",
+                            lines=5,
+                        )
+                        epigenetic_file_input = gr.File(label="Upload Epigenetic Data (BED/BigWig)")
+                        analyze_epigenetic_btn = gr.Button("Analyze Epigenetics")
+
+                    with gr.Column():
+                        epigenetic_output = gr.Textbox(label="Epigenetic Analysis Results", lines=10)
+                        epigenetic_viz = gr.Image(label="Epigenetic Marks Visualization")
+
+                analyze_epigenetic_btn.click(
+                    fn=self.analyze_epigenetics,
+                    inputs=[epigenetic_sequence_input, epigenetic_file_input],
+                    outputs=[epigenetic_output, epigenetic_viz],
                 )
 
             with gr.Tab("About"):
                 gr.Markdown(
                     """
-                # HDC Genomic Supercomputer
-                
-                This interface provides access to a Hyperdimensional Computing (HDC) based DNA analysis system. 
-                
-                ## What is HDC?
-                Hyperdimensional Computing is a computational framework inspired by patterns of neural activity in the brain.
-                It represents information using high-dimensional vectors (thousands of dimensions), enabling robust pattern
-                recognition and efficient computation on complex data like DNA sequences.
-                
-                ## Features
-                - Sequence encoding in high-dimensional vector spaces
-                - Sequence similarity analysis
-                - Motif detection
-                - Sequence imputation (filling in missing segments)
-                
-                ## Current Configuration
-                - Vector dimension: {0}
-                - Computing device: {1}
-                - Max k-mer size: {2}
-                """.format(
+                    # HDC Genomic Supercomputer
+
+                    This interface provides access to a Hyperdimensional Computing (HDC) based DNA analysis system.
+
+                    ## What is HDC?
+                    Hyperdimensional Computing is a computational framework inspired by patterns of neural activity in the brain.
+                    It represents information using high-dimensional vectors (thousands of dimensions), enabling robust pattern
+                    recognition and efficient computation on complex data like DNA sequences.
+
+                    ## Features
+                    - Sequence encoding in high-dimensional vector spaces
+                    - Sequence similarity analysis
+                    - Motif detection
+                    - Sequence imputation (filling in missing segments)
+                    - Variant impact analysis
+                    - Comparative genomics
+                    - Epigenetic data integration
+
+                    ## Current Configuration
+                    - Vector dimension: {0}
+                    - Computing device: {1}
+                    - Max k-mer size: {2}
+                    """.format(
                         self.config.dimension,
                         self.config.device,
                         self.config.max_kmer_size,
@@ -2841,6 +4522,6 @@ if __name__ == "__main__":
         ui = HDCGenomicUI()
         demo = ui.build_interface()
         demo.launch(share="--share" in sys.argv)
-    else: # Use CLI mode
+    else:  # Use CLI mode
         args = parse_args()
         run_genetic_analysis(args)
