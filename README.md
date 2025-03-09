@@ -282,16 +282,4 @@ print(f"Imputation: {imputation}")
 
 This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
 
----
 
-## Acknowledgments
-
-- **Hyperdimensional Computing**: Inspired by research in brain-inspired computing.
-- **Gradio**: For the interactive web interface.
-- **CuPy**: For GPU acceleration.
-
----
-
-## Contact
-
-For questions or feedback, please contact [Your Name] at [your.email@example.com].
