@@ -1,3 +1,7 @@
+Here’s the updated **README** with the new features and improvements integrated into the project description:
+
+---
+
 # Genetic Supercomputer: HDC-Powered Genomic Analysis
 
 This project introduces a novel approach to genomic sequence analysis using **Hyperdimensional Computing (HDC)**. It leverages HDC to efficiently encode, analyze, predict, and impute DNA/RNA sequences, providing scalable solutions for large-scale genomic datasets. The system includes key components such as HDC vector spaces, specialized DNA encoders, RL-powered agents, and swarm intelligence for advanced sequence analysis.
@@ -28,6 +32,16 @@ This project introduces a novel approach to genomic sequence analysis using **Hy
 
 - **Meta-Learning**: Includes the `MetaHDConservation` module for learning and predicting **evolutionary conservation patterns**.
 
+- **Interactive Web Interface**: A **Gradio-based UI** for easy interaction with the system, including:
+  - **Sequence Encoding and Visualization**
+  - **Motif Discovery**
+  - **Variant Analysis**
+  - **Comparative Genomics**
+  - **Epigenetic Analysis**
+  - **Sequence Imputation**
+
+---
+
 ## Core Components
 
 - **`HDCVectorSpace`**: The foundation of all HDC operations, handling vector creation, binding, bundling, permutation, similarity calculations, and batch processing.
@@ -48,6 +62,10 @@ This project introduces a novel approach to genomic sequence analysis using **Hy
 
 - **`MetaHDConservation`**: A meta-learning system that learns conservation patterns across sequences.
 
+- **`HDCGenomicUI`**: A Gradio-based web interface for interactive sequence analysis.
+
+---
+
 ## Getting Started
 
 ### Installation
@@ -55,8 +73,8 @@ This project introduces a novel approach to genomic sequence analysis using **Hy
 1. **Clone the Repository:**
 
    ```bash
-   git clone https://github.com/<your-username>/genetic-supercomputer.git
-   cd genetic-supercomputer
+   git clone https://github.com/jeffmeloy/GSC
+   cd GSC
    ```
 
 2. **Create a Virtual Environment (Recommended):**
@@ -84,7 +102,11 @@ This project introduces a novel approach to genomic sequence analysis using **Hy
    sudo apt-get install libcurl4-openssl-dev libssl-dev
    ```
 
-### Usage (CLI)
+---
+
+## Usage
+
+### **Command-Line Interface (CLI)**
 
 The `genetic_supercomputer.py` script offers a unified CLI for all functionalities.
 
@@ -140,7 +162,27 @@ python genetic_supercomputer.py impute --help
 python genetic_supercomputer.py analyze --help
 ```
 
-### Example Workflow
+---
+
+### **Interactive Web Interface**
+
+The **Gradio-based UI** provides an easy-to-use interface for sequence analysis. To launch the interface:
+
+```bash
+python genetic_supercomputer.py ui
+```
+
+#### Features of the Web Interface:
+- **Encode & Analyze**: Encode sequences and visualize their vector representations.
+- **Motif Discovery**: Discover regulatory motifs in DNA sequences.
+- **Variant Analysis**: Analyze the impact of genetic variants on sequence function.
+- **Comparative Genomics**: Compare sequences across species and identify conserved regions.
+- **Epigenetic Analysis**: Integrate and analyze epigenetic data alongside DNA sequences.
+- **Sequence Imputation**: Fill in missing sequence segments using HDC or RL-based strategies.
+
+---
+
+### **Example Workflow**
 
 1. **Prepare your data**: Create a FASTA file (e.g., `my_sequences.fasta`) containing DNA sequences.
 
@@ -168,7 +210,9 @@ python genetic_supercomputer.py analyze --help
    python genetic_supercomputer.py impute --model my_trained_model.h5 --prefix "GCTAGCTAGCTAGCTAGCTAGC" --suffix "AGCTAGCTAGCTAGCTAGCTA" --gap-length 25
    ```
 
-### API Usage (Python)
+---
+
+### **API Usage (Python)**
 
 The system is organized into modular classes. Below is an example of using the `DNASupercomputer` and `GeneticSwarm` components directly:
 
@@ -207,7 +251,9 @@ imputation = swarm.impute_segment("ATGCGT", "AGCTAGCTA", gap_length=5)
 print(f"Imputation: {imputation}")
 ```
 
-### Project Structure
+---
+
+## Project Structure
 
 - **`genetic_supercomputer.py`**: Core classes and functions:
   - `HDCVectorSpace`: Base HDC class.
@@ -224,4 +270,28 @@ print(f"Imputation: {imputation}")
   - `save_results()`: Result saving (HDF5, NumPy, JSON).
   - `run_genetic_analysis()`: Main function for CLI.
 
+- **`ui.py`**: Gradio-based web interface for interactive sequence analysis.
+
+- **`requirements.txt`**: List of Python dependencies.
+
+- **`README.md`**: Project documentation.
+
 ---
+
+## License
+
+This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
+
+---
+
+## Acknowledgments
+
+- **Hyperdimensional Computing**: Inspired by research in brain-inspired computing.
+- **Gradio**: For the interactive web interface.
+- **CuPy**: For GPU acceleration.
+
+---
+
+## Contact
+
+For questions or feedback, please contact [Your Name] at [your.email@example.com].
