@@ -1,7 +1,3 @@
-Here’s the updated **README** with the new features and improvements integrated into the project description:
-
----
-
 # Genetic Supercomputer: HDC-Powered Genomic Analysis
 
 This project introduces a novel approach to genomic sequence analysis using **Hyperdimensional Computing (HDC)**. It leverages HDC to efficiently encode, analyze, predict, and impute DNA/RNA sequences, providing scalable solutions for large-scale genomic datasets. The system includes key components such as HDC vector spaces, specialized DNA encoders, RL-powered agents, and swarm intelligence for advanced sequence analysis.
